@@ -49,11 +49,15 @@ def init_speculator(
 
         return DSparkSpeculator(vllm_config, device)
     elif speculative_config.use_gemma4_mtp():
-        from vllm.v1.worker.gpu.spec_decode.gemma4.speculator import (
-            Gemma4Speculator,
+        from vllm.v1.worker.gpu.spec_decode.gemma4.prompt_lookup import (
+            gemma4_speculator_class,
         )
 
-        return Gemma4Speculator(vllm_config, device)
+        speculator = gemma4_speculator_class()(vllm_config, device)
+        # Speculators that draft from each request's own tokens read them here.
+        if hasattr(speculator, "attach_request_states"):
+            speculator.attach_request_states(req_states)
+        return speculator
     elif speculative_config.use_multi_module_mtp():
         from vllm.v1.worker.gpu.spec_decode.multi_module_mtp.speculator import (
             MultiModuleMTPSpeculator,
