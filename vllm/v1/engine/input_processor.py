@@ -137,7 +137,7 @@ class InputProcessor:
         params.watermarking = watermarking
 
     def validate_prefill_only_config(self) -> None:
-        """Reject unsupported dev engine modes before queuing any work."""
+        """Reject unsupported prefill-only configurations before queuing work."""
         config = self.vllm_config
         parallel = config.parallel_config
         model = self.model_config
@@ -162,7 +162,7 @@ class InputProcessor:
             or self.cache_config.kv_sharing_fast_prefill
         ):
             raise VLLMValidationError(
-                "prefill_only requires the enabled dev endpoint, V2, one rank, "
+                "prefill_only requires MALLOW_ENABLE_PREFILL_ENDPOINT=1, V2, one rank, "
                 "text-only autoregressive inputs, and no watermark or fast prefill"
             )
         spec = self.speculative_config
