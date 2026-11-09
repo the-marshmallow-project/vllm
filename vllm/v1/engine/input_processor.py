@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
+import os
 import time
 from collections.abc import Callable, Mapping
 from typing import Any, Literal
@@ -127,6 +128,47 @@ class InputProcessor:
         )
         params.watermarking = watermarking
 
+    def validate_prefill_only_config(self) -> None:
+        """Reject unsupported dev engine modes before queuing any work."""
+        config = self.vllm_config
+        parallel = config.parallel_config
+        model = self.model_config
+        if (
+            os.environ.get("MALLOW_ENABLE_PREFILL_ENDPOINT") != "1"
+            or not config.use_v2_model_runner
+            or any(
+                getattr(parallel, name) != 1
+                for name in (
+                    "tensor_parallel_size",
+                    "pipeline_parallel_size",
+                    "data_parallel_size",
+                    "prefill_context_parallel_size",
+                    "decode_context_parallel_size",
+                )
+            )
+            or model.is_encoder_decoder
+            or model.is_diffusion
+            or self.supports_mm_inputs
+            or model.enable_prompt_embeds
+            or config.watermark_config is not None
+            or self.cache_config.kv_sharing_fast_prefill
+        ):
+            raise VLLMValidationError(
+                "prefill_only requires the enabled dev endpoint, V2, one rank, "
+                "text-only autoregressive inputs, and no watermark or fast prefill"
+            )
+        spec = self.speculative_config
+        if spec is not None and (
+            not spec.use_gemma4_mtp()
+            or not os.environ.get("MALLOW_PROMPT_LOOKUP_MAX")
+            or spec.draft_sample_method != "greedy"
+            or spec.enable_adaptive_verification
+        ):
+            raise VLLMValidationError(
+                "prefill_only supports no speculator or Gemma4 MTP prompt lookup "
+                "with greedy drafting and no adaptive verification"
+            )
+
     def _validate_params(
         self,
         params: SamplingParams | PoolingParams,
@@ -140,6 +182,8 @@ class InputProcessor:
         """
         watermarking: bool | None = None
         if isinstance(params, SamplingParams):
+            if params.prefill_only:
+                self.validate_prefill_only_config()
             supported_generation_tasks = [
                 task for task in supported_tasks if task in GENERATION_TASKS
             ]
@@ -177,7 +221,7 @@ class InputProcessor:
                     vocab_size=self.model_config.get_vocab_size(),
                 )
 
-            if self.model_config.return_sampling_mask:
+            if self.model_config.return_sampling_mask and not params.prefill_only:
                 if params.temperature <= 0:
                     raise ValueError(
                         "sampling distribution replay requires temperature > 0"
@@ -376,6 +420,11 @@ class InputProcessor:
     ) -> EngineCoreRequest:
         watermarking = self._validate_params(params, supported_tasks)
         self._validate_lora(lora_request)
+        prefill_only = isinstance(params, SamplingParams) and params.prefill_only
+        if prefill_only and (resumable or lora_request is not None):
+            raise VLLMValidationError(
+                "prefill_only does not support streaming input or LoRA requests"
+            )
 
         parallel_config = self.vllm_config.parallel_config
         dp_size = parallel_config.data_parallel_size
@@ -418,7 +467,13 @@ class InputProcessor:
         current_platform.validate_request(engine_input, params)
 
         encoder_input, decoder_input = split_enc_dec_input(engine_input)
-        self._validate_model_inputs(encoder_input, decoder_input)
+        if prefill_only and (
+            encoder_input is not None or decoder_input["type"] != "token"
+        ):
+            raise VLLMValidationError("prefill_only requires a text token prompt")
+        self._validate_model_inputs(
+            encoder_input, decoder_input, prefill_only=prefill_only
+        )
 
         # Mypy can be conservative for TypedDict unions; normalize access.
         if decoder_input["type"] == "embeds":
@@ -481,12 +536,13 @@ class InputProcessor:
                         f"{sampling_params.min_tokens}."
                     )
 
-            sampling_params.update_from_generation_config(
-                self.generation_config_fields,
-                self.renderer.get_eos_token_id(),
-            )
-            if self.tokenizer is not None:
-                sampling_params.update_from_tokenizer(self.tokenizer)
+            if not prefill_only:
+                sampling_params.update_from_generation_config(
+                    self.generation_config_fields,
+                    self.renderer.get_eos_token_id(),
+                )
+                if self.tokenizer is not None:
+                    sampling_params.update_from_tokenizer(self.tokenizer)
             if sampling_params.trace_decode_token_ids:
                 self._normalize_trace_replay_params(sampling_params, prompt_len)
         else:
@@ -553,6 +609,7 @@ class InputProcessor:
         self,
         prompt_len: int,
         prompt_type: Literal["encoder", "decoder"],
+        prefill_only: bool = False,
     ):
         if self.skip_prompt_length_check and prompt_type == "encoder":
             return
@@ -585,7 +642,11 @@ class InputProcessor:
                 f"longer than the maximum model length of {max_prompt_len}. "
                 f"{suggestion}"
             )
-        elif prompt_len == max_prompt_len and model_config.runner_type == "generate":
+        elif (
+            prompt_len == max_prompt_len
+            and model_config.runner_type == "generate"
+            and not prefill_only
+        ):
             suggestion = (
                 "Make sure that `max_model_len` is no smaller than the "
                 "number of text tokens (prompt + requested output tokens)."
@@ -600,6 +661,7 @@ class InputProcessor:
         self,
         prompt_input: SingletonInput,
         prompt_type: Literal["encoder", "decoder"],
+        prefill_only: bool = False,
     ) -> None:
         prompt_ids = (
             None
@@ -611,7 +673,7 @@ class InputProcessor:
         )
 
         prompt_len = length_from_prompt_token_ids_or_embeds(prompt_ids, prompt_embeds)
-        self._validate_prompt_len(prompt_len, prompt_type)
+        self._validate_prompt_len(prompt_len, prompt_type, prefill_only=prefill_only)
 
         if prompt_input["type"] == "embeds":
             is_token_ids = prompt_input.get("is_token_ids")
@@ -645,8 +707,11 @@ class InputProcessor:
         self,
         encoder_input: SingletonInput | None,
         decoder_input: SingletonInput,
+        prefill_only: bool = False,
     ):
         if encoder_input is not None:
             self._validate_model_input(encoder_input, prompt_type="encoder")
 
-        self._validate_model_input(decoder_input, prompt_type="decoder")
+        self._validate_model_input(
+            decoder_input, prompt_type="decoder", prefill_only=prefill_only
+        )

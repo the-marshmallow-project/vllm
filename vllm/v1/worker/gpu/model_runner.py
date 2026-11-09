@@ -149,6 +149,11 @@ from vllm.v1.worker.gpu.mm.lora import set_active_mm_loras
 from vllm.v1.worker.gpu.model_states import init_model_state
 from vllm.v1.worker.gpu.pool.pooling_runner import PoolingRunner
 from vllm.v1.worker.gpu.pp_utils import PPHandler
+from vllm.v1.worker.gpu.prefill_only import (
+    check_prefill_only_support,
+    completion_inputs,
+    scatter_completion_output,
+)
 from vllm.v1.worker.gpu.sample.batch_shard import (
     BatchSharder,
     all_to_all_vocab_shards,
@@ -1268,6 +1273,12 @@ class GPUModelRunner(LoRAModelRunnerMixin):
     def add_requests(self, scheduler_output: SchedulerOutput) -> None:
         for new_req_data in scheduler_output.scheduled_new_reqs:
             req_id = new_req_data.req_id
+            sampling_params = new_req_data.sampling_params
+            prefill_only = bool(
+                sampling_params and getattr(sampling_params, "prefill_only", False)
+            )
+            if prefill_only:
+                check_prefill_only_support(self)
 
             # Streaming input update: request already exists from a prior
             # chunk. Remove old state so it can be cleanly re-added below
@@ -1275,13 +1286,13 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             self._remove_request(req_id)
 
             prompt_len = new_req_data.prompt_len
-            sampling_params = new_req_data.sampling_params
             self.req_states.add_request(
                 req_id=req_id,
                 prompt_len=prompt_len,
                 all_token_ids=new_req_data.prefill_token_ids,
                 num_computed_tokens=new_req_data.num_computed_tokens,
                 max_tokens=sampling_params.max_tokens if sampling_params else 1,  # type: ignore[arg-type]
+                prefill_only=prefill_only,
             )
             req_index = self.req_states.req_id_to_index[req_id]
             if self.adaptive_verification is not None:
@@ -2248,9 +2259,26 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                 self.pcp_manager.restore_for_sampling(hidden_states, aux_hidden_states)
             )
 
-        sampler_output, num_sampled, num_rejected = self.sample(
-            hidden_states, input_batch, grammar_output
+        sampling_batch, sampling_hidden_states, completion_rows = completion_inputs(
+            input_batch, hidden_states, self.req_states.prefill_only
         )
+        sampled_output = None
+        if sampling_batch is not None:
+            sampled_output, _, _ = self.sample(
+                sampling_hidden_states, sampling_batch, grammar_output
+            )
+        sampler_output = scatter_completion_output(
+            sampled_output,
+            completion_rows,
+            input_batch.num_reqs,
+            hidden_states.device,
+            sampling_batch.cu_num_logits_np if sampling_batch is not None else None,
+        )
+        num_sampled, num_rejected = (
+            sampler_output.num_sampled,
+            sampler_output.num_rejected,
+        )
+        assert num_sampled is not None and num_rejected is not None
 
         if self.pp_handler is not None:
             # Broadcast to non-last PP ranks (handles spec decode multi-token).
@@ -2262,22 +2290,25 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             )
 
         assert self.prompt_logprobs_worker is not None
-        prompt_logprobs_dict = self.prompt_logprobs_worker.compute_prompt_logprobs(
-            self.model.compute_logits,
-            hidden_states,
-            input_batch,
-            self.req_states.all_token_ids.gpu,
-            self.req_states.num_computed_tokens.gpu,
-            self.req_states.prompt_len.np,
-        )
-        prompt_token_id_logprobs_dict = (
-            self.prompt_logprobs_worker.compute_prompt_token_id_logprobs(
+        prompt_logprobs_dict = {}
+        prompt_token_id_logprobs_dict = {}
+        if sampling_batch is not None:
+            prompt_logprobs_dict = self.prompt_logprobs_worker.compute_prompt_logprobs(
                 self.model.compute_logits,
-                hidden_states,
-                input_batch,
+                sampling_hidden_states,
+                sampling_batch,
+                self.req_states.all_token_ids.gpu,
+                self.req_states.num_computed_tokens.gpu,
                 self.req_states.prompt_len.np,
             )
-        )
+            prompt_token_id_logprobs_dict = (
+                self.prompt_logprobs_worker.compute_prompt_token_id_logprobs(
+                    self.model.compute_logits,
+                    sampling_hidden_states,
+                    sampling_batch,
+                    self.req_states.prompt_len.np,
+                )
+            )
 
         # Prepare the model runner output.
         model_runner_output = ModelRunnerOutput(

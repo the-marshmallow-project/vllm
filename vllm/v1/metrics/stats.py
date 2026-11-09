@@ -514,6 +514,7 @@ class IterationStats:
         req_stats: RequestStateStats,
         lora_states: "LoRARequestStates",
         lora_name: str | None,
+        prefill_only: bool = False,
     ):
         num_new_generation_tokens = len(output.new_token_ids)
 
@@ -522,9 +523,10 @@ class IterationStats:
             if output.prefill_stats is not None:
                 self.prompt_token_stats.update_from_output(output.prefill_stats)
 
-            first_token_latency = self._time_since(req_stats.arrival_time)
-            self.time_to_first_tokens_iter.append(first_token_latency)
-            req_stats.first_token_latency = first_token_latency
+            if not prefill_only:
+                first_token_latency = self._time_since(req_stats.arrival_time)
+                self.time_to_first_tokens_iter.append(first_token_latency)
+                req_stats.first_token_latency = first_token_latency
 
         req_stats.num_generation_tokens += num_new_generation_tokens
 

@@ -57,7 +57,10 @@ class SpeculatorCudaGraphManager(CudaGraphManager):
         progress_bar_desc: str = "Capturing CUDA graphs",
         specialize_spec_tokens: bool = False,
         slot_mappings_buffer: torch.Tensor | None = None,
+        num_speculative_steps: int | None = None,
     ) -> None:
+        if num_speculative_steps is None:
+            num_speculative_steps = self.vllm_config.num_speculative_tokens
         if specialize_spec_tokens:
             speculative_config = self.vllm_config.speculative_config
             assert speculative_config is not None
@@ -66,11 +69,12 @@ class SpeculatorCudaGraphManager(CudaGraphManager):
                 vllm_max_batch_size=self.max_num_reqs,
                 vllm_num_speculative_tokens=self.vllm_config.num_speculative_tokens,
             )
+            draft_steps = {min(k, num_speculative_steps) for k in dense_schedule}
             self._capture_descs = {
                 mode: [
                     SpeculatorBatchDescriptor(**vars(desc), num_speculative_tokens=k)
                     for desc in descs
-                    for k in sorted(set(dense_schedule) - {0, 1}, reverse=True)
+                    for k in sorted(draft_steps - {0, 1}, reverse=True)
                 ]
                 for mode, descs in self._capture_descs.items()
             }
@@ -104,7 +108,7 @@ class SpeculatorCudaGraphManager(CudaGraphManager):
                 forward_kwargs["num_speculative_steps"] = (
                     desc.num_speculative_tokens
                     if isinstance(desc, SpeculatorBatchDescriptor)
-                    else self.vllm_config.num_speculative_tokens
+                    else num_speculative_steps
                 )
             return lambda cg_mode: forward_fn(
                 num_reqs,
