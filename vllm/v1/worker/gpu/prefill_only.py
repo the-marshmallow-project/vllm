@@ -4,7 +4,6 @@
 
 from __future__ import annotations
 
-import os
 from dataclasses import replace
 from typing import TYPE_CHECKING
 
@@ -191,8 +190,7 @@ def check_prefill_only_support(runner) -> None:
 
     parallel = runner.vllm_config.parallel_config
     supported = (
-        os.environ.get("MALLOW_ENABLE_PREFILL_ENDPOINT") == "1"
-        and all(
+        all(
             getattr(parallel, name) == 1
             for name in (
                 "tensor_parallel_size",
