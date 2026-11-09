@@ -156,6 +156,7 @@ class TargetDependentARSpeculator(DraftModelSpeculator):
             self.attn_groups,
             self.kv_cache_config,
             progress_bar_desc="Capturing decode CUDA graphs",
+            num_speculative_steps=self.num_speculative_steps,
             specialize_spec_tokens=self.supports_decode_metadata_update
             and self.speculative_config.uses_dynamic_speculative_decoding(),
         )

@@ -2,7 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """Read-only prefix lookup and positional cache hits across storage pools."""
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Protocol
 
 from vllm.v1.core.block_pool import BlockPool
@@ -74,6 +74,9 @@ class JointCacheHit:
     num_cpu_tokens: int
     lookup: JointCacheLookup
     pinned: bool = False
+    _pin_blocks: tuple[list[KVCacheBlock], list[KVCacheBlock]] | None = field(
+        default=None, init=False, repr=False, compare=False
+    )
 
     @classmethod
     def find(
@@ -95,24 +98,35 @@ class JointCacheHit:
                 length // scheduler_block_size * scheduler_block_size,
                 lookup=lookup,
             )
-        hits = tuple(
-            [CacheHitBlock(block, block.pool is lookup.cpu) for block in group]
-            for group in blocks
-        )
+        hits: list[list[CacheHitBlock]] = []
+        gpu_blocks: list[KVCacheBlock] = []
+        cpu_blocks: list[KVCacheBlock] = []
+        null_hit = CacheHitBlock(lookup.null_block)
         gpu_prefix_tokens = length
         cpu_hash_blocks: set[int] = set()
         hash_block_size = lookup.hash_block_size
-        for group, manager in zip(hits, coordinator.single_type_managers, strict=True):
-            for index, hit in enumerate(group):
-                if hit.is_cpu:
+        for group, manager in zip(
+            blocks, coordinator.single_type_managers, strict=True
+        ):
+            group_hits: list[CacheHitBlock] = []
+            for index, block in enumerate(group):
+                if block is lookup.null_block:
+                    group_hits.append(null_hit)
+                    continue
+                is_cpu = block.pool is lookup.cpu
+                group_hits.append(CacheHitBlock(block, is_cpu))
+                if not block.is_null:
+                    (cpu_blocks if is_cpu else gpu_blocks).append(block)
+                if is_cpu:
                     start = index * manager.block_size
                     end = min(start + manager.block_size, length)
                     gpu_prefix_tokens = min(gpu_prefix_tokens, start)
                     cpu_hash_blocks.update(
                         range(start // hash_block_size, end // hash_block_size)
                     )
-        return cls(
-            blocks=hits,
+            hits.append(group_hits)
+        hit = cls(
+            blocks=tuple(hits),
             num_computed_tokens=length,
             num_gpu_prefix_tokens=(
                 gpu_prefix_tokens // scheduler_block_size * scheduler_block_size
@@ -123,6 +137,20 @@ class JointCacheHit:
             shared_prefix_boundary=length + uncached if uncached else 0,
             lookup=lookup,
         )
+        hit._pin_blocks = (gpu_blocks, cpu_blocks)
+        return hit
+
+    def _get_pin_blocks(self) -> tuple[list[KVCacheBlock], list[KVCacheBlock]]:
+        if self._pin_blocks is None:
+            # Keep a reference for every non-null position, even for repeated blocks.
+            gpu_blocks: list[KVCacheBlock] = []
+            cpu_blocks: list[KVCacheBlock] = []
+            for group in self.blocks:
+                for hit in group:
+                    if not hit.block.is_null:
+                        (cpu_blocks if hit.is_cpu else gpu_blocks).append(hit.block)
+            self._pin_blocks = (gpu_blocks, cpu_blocks)
+        return self._pin_blocks
 
     @property
     def num_gpu_tokens(self) -> int:
@@ -134,27 +162,19 @@ class JointCacheHit:
 
     def pin(self) -> None:
         assert not self.pinned
-        for pool, is_cpu in ((self.lookup.gpu, False), (self.lookup.cpu, True)):
-            pool.touch(
-                [
-                    hit.block
-                    for group in self.blocks
-                    for hit in group
-                    if not hit.block.is_null and hit.is_cpu == is_cpu
-                ]
-            )
+        for pool, blocks in zip(
+            (self.lookup.gpu, self.lookup.cpu), self._get_pin_blocks(), strict=True
+        ):
+            pool.touch(blocks)
         self.pinned = True
 
     def release(self) -> None:
         if not self.pinned:
             return
-        for pool, is_cpu in ((self.lookup.gpu, False), (self.lookup.cpu, True)):
-            pool.free_blocks(
-                hit.block
-                for group in self.blocks
-                for hit in group
-                if not hit.block.is_null and hit.is_cpu == is_cpu
-            )
+        for pool, blocks in zip(
+            (self.lookup.gpu, self.lookup.cpu), self._get_pin_blocks(), strict=True
+        ):
+            pool.free_blocks(blocks)
         self.pinned = False
 
     def allocation_blocks(self) -> tuple[list[KVCacheBlock], ...]:

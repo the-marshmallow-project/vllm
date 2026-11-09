@@ -336,6 +336,12 @@ class SamplingParams(
     tokens after the EOS token is generated."""
     max_tokens: int | None = 16
     """Maximum number of tokens to generate per output sequence."""
+    prefill_only: bool = False
+    """Prepare the prompt KV cache without generating output tokens.
+
+    Dev V2 text-only intent. ``max_tokens=1`` remains an internal capacity
+    sentinel; it does not authorize sampling a token for this request.
+    """
     min_tokens: int = 0
     """Minimum number of tokens to generate per output sequence before EOS or
     `stop_token_ids` can be generated"""
@@ -633,6 +639,22 @@ class SamplingParams(
 
     def _verify_args(self) -> None:
         _verify_num_sequences(self.n, "n")
+        if self.prefill_only and (
+            self.n != 1
+            or self.max_tokens != 1
+            or self.min_tokens != 0
+            or self.logprobs is not None
+            or self.prompt_logprobs is not None
+            or self.prompt_logprob_token_ids is not None
+            or self.logprob_token_ids is not None
+            or self.structured_outputs is not None
+            or self.trace_decode_token_ids
+            or self.thinking_token_budget is not None
+        ):
+            raise VLLMValidationError(
+                "prefill_only requires n=1, max_tokens=1, min_tokens=0 and "
+                "no logprobs, structured outputs, trace replay or thinking budget"
+            )
         if self.extra_args:
             self._verify_extra_args()
         if not -2.0 <= self.presence_penalty <= 2.0:

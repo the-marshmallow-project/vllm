@@ -10,7 +10,6 @@ from unittest.mock import Mock
 
 import pytest
 import torch
-
 from vllm import SamplingParams
 from vllm.config import (
     CacheConfig,
@@ -29,6 +28,7 @@ from vllm.distributed.kv_transfer.kv_connector.v1.simple_cpu_offload_connector i
 )
 from vllm.utils.hashing import sha256
 from vllm.v1.core.block_pool import BlockPool
+from vllm.v1.core.kv_cache_lookup import CacheHitBlock, JointCacheHit, JointCacheLookup
 from vllm.v1.core.kv_cache_manager import KVCacheBlocks, KVCacheManager
 from vllm.v1.core.kv_cache_utils import (
     get_request_block_hasher,
@@ -4077,3 +4077,185 @@ def test_eager_store_matches_gpu_cacheable_prefix(
         scheduler.cpu_block_pool.blocks[bid].block_hash
         for bid in load_meta.load_cpu_blocks
     ] == target_hashes + draft_hashes
+
+
+# Joint-hit bookkeeping uses real block pools without model configuration.
+def _joint_metadata_case(groups, group_sizes, length, *, uncached=0):
+    from types import SimpleNamespace
+    from unittest.mock import Mock
+
+    gpu, cpu = (BlockPool(32, True, BLOCK_SIZE) for _ in range(2))
+    lookup = JointCacheLookup(gpu, cpu)
+    gpu_blocks = gpu.get_new_blocks(4)
+    cpu_blocks = cpu.get_new_blocks(4)
+    gpu.free_blocks(gpu_blocks)
+    cpu.free_blocks(cpu_blocks)
+    raw_groups = groups(gpu.null_block, gpu_blocks, cpu_blocks)
+    coordinator = SimpleNamespace(
+        single_type_managers=[SimpleNamespace(block_size=n) for n in group_sizes],
+        find_longest_cache_hit=Mock(return_value=(raw_groups, length, uncached)),
+    )
+    return lookup, coordinator, raw_groups, gpu_blocks, cpu_blocks
+
+
+def test_joint_hit_shares_sparse_null_metadata(monkeypatch):
+    """Long null prefixes retain their positions without per-position objects."""
+    import vllm.v1.core.kv_cache_lookup as module
+
+    lookup, coordinator, raw, gpu, _ = _joint_metadata_case(
+        lambda null, gpu, cpu: ([null] * 1024 + [gpu[0]], [null] * 512 + [gpu[1]]),
+        [16, 32],
+        16400,
+    )
+    constructed = []
+
+    def record_wrapper(*args):
+        wrapper = CacheHitBlock(*args)
+        constructed.append(wrapper)
+        return wrapper
+
+    monkeypatch.setattr(module, "CacheHitBlock", record_wrapper)
+    hit = JointCacheHit.find(coordinator, lookup, [], 16400, 32)
+    assert len(constructed) == 3
+    assert hit.blocks[0][0] is hit.blocks[0][1023] is hit.blocks[1][511]
+    assert hit.num_computed_tokens == hit.num_gpu_prefix_tokens == 16400
+    assert not hit.needs_load
+    allocated = hit.allocation_blocks()
+    assert [len(group) for group in allocated] == [1025, 513]
+    assert all(
+        a is b for result, source in zip(allocated, raw) for a, b in zip(result, source)
+    )
+    hit.pin()
+    assert [block.ref_cnt for block in gpu[:2]] == [1, 1]
+    hit.release()
+    assert all(block.ref_cnt == 0 for block in gpu)
+    assert lookup.gpu.null_block.ref_cnt == lookup.cpu.null_block.ref_cnt == 0
+
+
+def test_joint_hit_mixed_group_coverage_and_placeholders():
+    """CPU token coverage is a union across group sizes; nulls stay positional."""
+    lookup, coordinator, _, gpu, cpu = _joint_metadata_case(
+        lambda null, gpu, cpu: ([gpu[0], cpu[0]], [null, cpu[1], gpu[1], gpu[2]]),
+        [32, 16],
+        64,
+        uncached=16,
+    )
+    hit = JointCacheHit.find(coordinator, lookup, [], 64, 32)
+    assert gpu[0].block_id == cpu[0].block_id
+    assert not hit.blocks[0][0].is_cpu and hit.blocks[0][1].is_cpu
+    assert hit.num_computed_tokens == 64
+    assert hit.num_cpu_tokens == 48
+    assert hit.num_gpu_tokens == 16
+    assert hit.num_gpu_prefix_tokens == 0
+    assert hit.shared_prefix_boundary == 80
+    allocated = hit.allocation_blocks()
+    assert allocated[0][0] is gpu[0]
+    assert allocated[1][0] is lookup.null_block
+    assert allocated[0][1].block_id == allocated[1][1].block_id == -1
+    assert allocated[0][1] is not allocated[1][1]
+    assert allocated[0][1].pool is allocated[1][1].pool is None
+    hit.pin()
+    assert [block.ref_cnt for block in gpu[:3]] == [1, 1, 1]
+    assert [block.ref_cnt for block in cpu[:2]] == [1, 1]
+    hit.release()
+    assert all(block.ref_cnt == 0 for block in [*gpu, *cpu])
+
+
+def test_joint_hit_pin_preserves_duplicate_reference_counts():
+    """Repeated positions own repeated references even to the same block."""
+    lookup, coordinator, _, gpu, cpu = _joint_metadata_case(
+        lambda null, gpu, cpu: ([gpu[0], gpu[0], cpu[0], cpu[0]],),
+        [16],
+        64,
+    )
+    hit = JointCacheHit.find(coordinator, lookup, [], 64, 16)
+    hit.pin()
+    assert gpu[0].ref_cnt == cpu[0].ref_cnt == 2
+    with pytest.raises(AssertionError):
+        hit.pin()
+    hit.release()
+    hit.release()
+    assert gpu[0].ref_cnt == cpu[0].ref_cnt == 0
+    assert lookup.gpu.get_num_free_blocks() == lookup.cpu.get_num_free_blocks() == 31
+
+
+def test_joint_hit_pins_retained_cpu_state_beyond_common_prefix():
+    """Retained hybrid states must stay pinned even outside CPU token coverage."""
+    lookup, coordinator, _, _, cpu = _joint_metadata_case(
+        lambda null, gpu, cpu: ([gpu[0]], [null, null, null, cpu[0]]),
+        [32, 32],
+        32,
+        uncached=96,
+    )
+    hit = JointCacheHit.find(coordinator, lookup, [], 128, 32)
+    assert hit.num_cpu_tokens == 0 and not hit.needs_load
+    assert hit.shared_prefix_boundary == 128
+    assert hit.blocks[1][3].is_cpu
+    hit.pin()
+    assert cpu[0].ref_cnt == 1
+    hit.release()
+    assert cpu[0].ref_cnt == 0
+
+
+def test_joint_hit_reconciles_unaligned_cpu_result_before_pin():
+    """A CPU source discarded by alignment must not be pinned or counted."""
+    lookup, coordinator, _, gpu, cpu = _joint_metadata_case(
+        lambda null, gpu, cpu: ([gpu[0], cpu[0]],),
+        [16],
+        31,
+    )
+    coordinator.find_longest_cache_hit.side_effect = [
+        (([gpu[0], cpu[0]],), 31, 0),
+        (([gpu[0]],), 16, 15),
+    ]
+    hit = JointCacheHit.find(coordinator, lookup, [], 31, 16)
+    assert [
+        call.args[1] for call in coordinator.find_longest_cache_hit.call_args_list
+    ] == [31, 16]
+    assert hit.num_computed_tokens == hit.num_gpu_prefix_tokens == 16
+    assert hit.shared_prefix_boundary == 31
+    assert not hit.needs_load
+    hit.pin()
+    assert gpu[0].ref_cnt == 1 and cpu[0].ref_cnt == 0
+    hit.release()
+
+
+def test_joint_hit_pin_and_release_do_not_rescan_padding():
+    """Pin lifetime work follows actual blocks, not a long positional prefix."""
+    lookup, coordinator, _, gpu, _ = _joint_metadata_case(
+        lambda null, gpu, cpu: ([null] * 1024 + [gpu[0]],), [16], 16400
+    )
+    hit = JointCacheHit.find(coordinator, lookup, [], 16400, 16)
+
+    class NoScan(list):
+        def __iter__(self):
+            raise AssertionError("pin/release rescanned positional padding")
+
+    hit.blocks = tuple(NoScan(group) for group in hit.blocks)
+    hit.pin()
+    assert gpu[0].ref_cnt == 1
+    hit.release()
+    assert gpu[0].ref_cnt == 0
+
+
+def test_joint_hit_direct_construction_preserves_pin_lifetime():
+    """Callers constructing a hit directly still get balanced pool ownership."""
+    lookup, _, _, gpu, cpu = _joint_metadata_case(lambda *args: (), [], 0)
+    hit = JointCacheHit(
+        blocks=(
+            [
+                CacheHitBlock(lookup.null_block),
+                CacheHitBlock(gpu[0]),
+                CacheHitBlock(cpu[0], True),
+            ],
+        ),
+        num_computed_tokens=48,
+        num_gpu_prefix_tokens=32,
+        shared_prefix_boundary=0,
+        num_cpu_tokens=16,
+        lookup=lookup,
+    )
+    hit.pin()
+    assert gpu[0].ref_cnt == cpu[0].ref_cnt == 1
+    hit.release()
+    assert gpu[0].ref_cnt == cpu[0].ref_cnt == 0

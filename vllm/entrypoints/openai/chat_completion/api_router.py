@@ -13,6 +13,8 @@ from vllm.entrypoints.openai.chat_completion.protocol import (
     ChatCompletionRequest,
     ChatCompletionResponse,
     ChatCompletionStreamResponse,
+    ChatPrefillRequest,
+    ChatPrefillResponse,
 )
 from vllm.entrypoints.openai.chat_completion.serving import OpenAIServingChat
 from vllm.entrypoints.serve.engine.protocol import ErrorResponse
@@ -83,6 +85,28 @@ async def create_chat_completion(request: ChatCompletionRequest, raw_request: Re
         content=with_sse_keep_alive(generator, float(keep_alive_interval)),
         media_type="text/event-stream",
     )
+
+
+@router.post(
+    "/v1/chat/prefill",
+    dependencies=[Depends(validate_json_request)],
+    responses={
+        HTTPStatus.OK.value: {"model": ChatPrefillResponse},
+        HTTPStatus.BAD_REQUEST.value: {"model": ErrorResponse},
+        HTTPStatus.NOT_FOUND.value: {"model": ErrorResponse},
+        HTTPStatus.INTERNAL_SERVER_ERROR.value: {"model": ErrorResponse},
+    },
+)
+@with_cancellation
+@load_aware_call
+async def create_chat_prefill(request: ChatPrefillRequest, raw_request: Request):
+    handler = chat(raw_request)
+    if handler is None:
+        raise NotImplementedError("The model does not support Chat Completions API")
+    result = await handler.create_chat_prefill(request, raw_request)
+    if isinstance(result, ErrorResponse):
+        return JSONResponse(content=result.model_dump(), status_code=result.error.code)
+    return JSONResponse(content=result.model_dump())
 
 
 @router.post(

@@ -3908,6 +3908,12 @@ class GPUModelRunner(
         scheduler_output: "SchedulerOutput",
         intermediate_tensors: IntermediateTensors | None = None,
     ) -> ModelRunnerOutput | AsyncModelRunnerOutput | IntermediateTensors | None:
+        if any(
+            req.sampling_params is not None
+            and getattr(req.sampling_params, "prefill_only", False)
+            for req in scheduler_output.scheduled_new_reqs
+        ):
+            raise ValueError("prefill_only requires the V2 GPU model runner")
         if self.execute_model_state is not None:
             raise RuntimeError(
                 "State error: sample_tokens() must be called "

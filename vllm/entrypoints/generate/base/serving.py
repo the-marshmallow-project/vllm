@@ -259,9 +259,12 @@ class GenerateBaseServing(BaseServing, BeamSearchOnlineMixin):
             priority = raw_request.headers.get(PRIORITY_HEADER)
             if priority is not None:
                 try:
-                    return int(priority)
+                    value = int(priority)
                 except ValueError:
                     pass
+                else:
+                    if -(1 << 63) <= value < (1 << 63):
+                        return value
         return request.priority
 
     async def _with_kv_transfer_rejection_cleanup(

@@ -58,6 +58,8 @@ class StreamingUpdate:
 
 
 class Request:
+    reply_first_queued_at: float = 0.0
+
     def __init__(
         self,
         request_id: str,
@@ -85,6 +87,7 @@ class Request:
         self.client_index = client_index
         self.priority = priority
         self.sampling_params = sampling_params
+        self.prefill_only = sampling_params is not None and sampling_params.prefill_only
         self.pooling_params = pooling_params
         self.lora_request = lora_request
         self.structured_output_request = StructuredOutputRequest.from_sampling_params(

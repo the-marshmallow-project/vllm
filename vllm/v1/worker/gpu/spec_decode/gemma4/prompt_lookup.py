@@ -17,14 +17,21 @@ wrong guess costs nothing more than padding, verification keeps outputs
 lossless, and every batch keeps its shape for CUDA graphs.
 
 Off unless `MALLOW_PROMPT_LOOKUP_MAX` is set; see `gemma4_speculator_class`.
+
+`MALLOW_SKIP_PREFILL_DRAFT=1` opts into bypassing proposals for one-token requests
+on a single rank. Mixed text batches draft only their remaining requests using
+independent Q-only queries against the target's frozen KV cache. Unsupported
+input modes and dummy/profile runs retain their original proposal path.
 """
 
 import os
 
+import numpy as np
 import torch
 
 from vllm.logger import init_logger
 from vllm.triton_utils import tl, triton
+from vllm.v1.worker.gpu.spec_decode.gemma4.prefill import can_compact_gemma4_prefill
 from vllm.v1.worker.gpu.spec_decode.gemma4.speculator import Gemma4Speculator
 
 logger = init_logger(__name__)
@@ -228,6 +235,25 @@ class Gemma4PromptLookupSpeculator(Gemma4Speculator):
         self.lookup_stats = torch.zeros(len(STATS), dtype=torch.int64, device=device)
         self.token_ids: torch.Tensor | None = None
         self.total_len: torch.Tensor | None = None
+        self.prompt_len_np: np.ndarray | None = None
+        self.max_seq_len_np: np.ndarray | None = None
+        self.prefill_only_np: np.ndarray | None = None
+        parallel = vllm_config.parallel_config
+        self.skip_prefill_draft = (
+            (
+                os.environ.get("MALLOW_SKIP_PREFILL_DRAFT") == "1"
+                or os.environ.get("MALLOW_ENABLE_PREFILL_ENDPOINT") == "1"
+            )
+            and parallel.tensor_parallel_size == 1
+            and parallel.pipeline_parallel_size == 1
+            and parallel.data_parallel_size == 1
+            and parallel.prefill_context_parallel_size == 1
+            and parallel.decode_context_parallel_size == 1
+            and not self.enable_adaptive_verification
+        )
+        self.full_batch_drafts = (
+            torch.zeros_like(self.draft_tokens) if self.skip_prefill_draft else None
+        )
         self.steps = 0
         logger.info(
             "Gemma4 MTP with prompt lookup: MTP drafts %d of %d slots, lookup "
@@ -253,6 +279,9 @@ class Gemma4PromptLookupSpeculator(Gemma4Speculator):
         which hold a step's sampled tokens before the runner calls `propose`."""
         self.token_ids = req_states.all_token_ids.gpu
         self.total_len = req_states.total_len.gpu
+        self.prompt_len_np = req_states.prompt_len.np
+        self.max_seq_len_np = req_states.max_seq_len
+        self.prefill_only_np = getattr(req_states, "prefill_only", None)
 
     @torch.inference_mode()
     def propose(
@@ -281,34 +310,128 @@ class Gemma4PromptLookupSpeculator(Gemma4Speculator):
         if num_speculative_tokens is None:
             num_speculative_tokens = self.num_slots
         mtp_steps = min(num_speculative_tokens, self.num_speculative_steps)
-        draft = super().propose(
-            input_batch,
-            attn_metadata,
-            slot_mappings,
-            last_hidden_states,
-            aux_hidden_states,
-            num_sampled,
-            num_rejected,
-            last_sampled,
-            next_prefill_tokens,
-            temperature,
-            seeds,
-            dp_sync_state=dp_sync_state,
-            dummy_run=dummy_run,
-            skip_attn_for_dummy_run=skip_attn_for_dummy_run,
-            mm_inputs=mm_inputs,
-            is_profile=is_profile,
-            num_speculative_tokens=mtp_steps,
+        if (
+            mtp_steps == 0
+            and not dummy_run
+            and not is_profile
+            and self.vllm_config.parallel_config.data_parallel_size == 1
+            and dp_sync_state is None
+            and self.pcp_manager is None
+        ):
+            self.lookup_extended[input_batch.idx_mapping[: input_batch.num_reqs]] = 0
+            return self.lookup_drafts[: input_batch.num_reqs].fill_(-1)
+
+        active_rows = None
+        draft = None
+        prefill_only_np = getattr(self, "prefill_only_np", None)
+        explicit_prefill = (
+            prefill_only_np is not None
+            and not dummy_run
+            and not is_profile
+            and np.any(prefill_only_np[input_batch.idx_mapping_np])
         )
-        if dummy_run or is_profile or self.token_ids is None:
+        if (
+            self.skip_prefill_draft
+            and not dummy_run
+            and not is_profile
+            and dp_sync_state is None
+            and self.pcp_manager is None
+            and self.draft_watermarker is None
+            and self.prompt_len_np is not None
+            and self.max_seq_len_np is not None
+            and self.token_ids is not None
+            and self.total_len is not None
+            and input_batch.num_reqs > 0
+            and mm_inputs is None
+            and not aux_hidden_states
+        ):
+            indices = input_batch.idx_mapping_np[: input_batch.num_reqs]
+            if (
+                len(indices) == input_batch.num_reqs
+                and indices.dtype.kind in "iu"
+                and np.all(indices >= 0)
+                and np.all(indices < len(self.prompt_len_np))
+                and np.all(indices < len(self.max_seq_len_np))
+            ):
+                one_token = (
+                    self.max_seq_len_np[indices] - self.prompt_len_np[indices] == 1
+                )
+                if prefill_only_np is not None:
+                    one_token |= prefill_only_np[indices]
+                if np.all(one_token):
+                    out = self.lookup_drafts[: input_batch.num_reqs]
+                    out.zero_()
+                    self.draft_tokens[: input_batch.num_reqs].zero_()
+                    self.lookup_extended[
+                        input_batch.idx_mapping[: input_batch.num_reqs]
+                    ] = 0
+                    return out
+                if (
+                    np.any(one_token)
+                    and can_compact_gemma4_prefill(
+                        getattr(self, "model_state", None),
+                        self.vllm_config.model_config,
+                    )
+                    and input_batch.positions.ndim == 1
+                    and getattr(input_batch, "fast_prefill", None) is None
+                ):
+                    active_rows = np.flatnonzero(~one_token)
+                    draft = self.propose_for_active_requests(
+                        input_batch,
+                        active_rows,
+                        last_hidden_states,
+                        num_sampled,
+                        num_rejected,
+                        last_sampled,
+                        next_prefill_tokens,
+                        temperature,
+                        seeds,
+                        mtp_steps,
+                    )
+                    prefill_indices = indices[one_token]
+                    self.prefill_req_indices[: len(prefill_indices)].copy_(
+                        torch.from_numpy(prefill_indices), non_blocking=True
+                    )
+                    self.lookup_extended.index_fill_(
+                        0, self.prefill_req_indices[: len(prefill_indices)], 0
+                    )
+        if draft is None:
+            if explicit_prefill:
+                raise RuntimeError("prefill_only requests cannot enter draft proposal")
+            draft = super().propose(
+                input_batch,
+                attn_metadata,
+                slot_mappings,
+                last_hidden_states,
+                aux_hidden_states,
+                num_sampled,
+                num_rejected,
+                last_sampled,
+                next_prefill_tokens,
+                temperature,
+                seeds,
+                dp_sync_state=dp_sync_state,
+                dummy_run=dummy_run,
+                skip_attn_for_dummy_run=skip_attn_for_dummy_run,
+                mm_inputs=mm_inputs,
+                is_profile=is_profile,
+                num_speculative_tokens=mtp_steps,
+            )
+        if dummy_run or is_profile or mtp_steps == 0 or self.token_ids is None:
             return draft
         assert self.total_len is not None
         num_reqs = draft.shape[0]
         out = self.lookup_drafts[:num_reqs]
+        idx_mapping = input_batch.idx_mapping[:num_reqs]
+        if active_rows is not None:
+            rows = self.compact_row_indices[:num_reqs]
+            idx_mapping = self.idx_mapping[:num_reqs]
+            num_sampled = num_sampled.index_select(0, rows)
+            num_rejected = num_rejected.index_select(0, rows)
         prompt_lookup(
             self.token_ids,
             self.total_len,
-            input_batch.idx_mapping[:num_reqs],
+            idx_mapping,
             draft,
             out,
             self.lookup_extended,
@@ -322,6 +445,12 @@ class Gemma4PromptLookupSpeculator(Gemma4Speculator):
         self.steps += 1
         if self.steps % LOG_EVERY == 0:
             self._log_stats()
+        if active_rows is not None:
+            assert self.full_batch_drafts is not None
+            full_out = self.full_batch_drafts[: input_batch.num_reqs]
+            full_out.zero_()
+            full_out.index_copy_(0, self.compact_row_indices[:num_reqs], out)
+            return full_out
         return out
 
     def _log_stats(self) -> None:

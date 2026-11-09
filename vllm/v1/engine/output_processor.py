@@ -204,6 +204,7 @@ class RequestState:
         temperature: float | None = None,
         stream_input: bool = False,
         remote_prefill_cached_tokens: int | None = None,
+        prefill_only: bool = False,
     ):
         self.request_id = request_id
         self.external_req_id = external_req_id
@@ -224,6 +225,7 @@ class RequestState:
         self.top_p = top_p
         self.n = n
         self.temperature = temperature
+        self.prefill_only = prefill_only
         self.is_prefilling = True
         self.queue = queue
         self.num_cached_tokens = 0
@@ -300,14 +302,18 @@ class RequestState:
             if sampling_params.stream_interval is not None:
                 # clamp to the engine-level stream interval.
                 stream_interval = max(sampling_params.stream_interval, stream_interval)
-            logprobs_processor = LogprobsProcessor.from_new_request(
-                tokenizer=tokenizer,
-                request=request,
-            )
-            detokenizer = IncrementalDetokenizer.from_new_request(
-                tokenizer=tokenizer,
-                request=request,
-            )
+            if sampling_params.prefill_only:
+                logprobs_processor = None
+                detokenizer = None
+            else:
+                logprobs_processor = LogprobsProcessor.from_new_request(
+                    tokenizer=tokenizer,
+                    request=request,
+                )
+                detokenizer = IncrementalDetokenizer.from_new_request(
+                    tokenizer=tokenizer,
+                    request=request,
+                )
             max_tokens_param = sampling_params.max_tokens
             top_p = sampling_params.top_p
             n = sampling_params.n
@@ -345,6 +351,10 @@ class RequestState:
             stream_interval=stream_interval,
             stream_input=request.resumable,
             remote_prefill_cached_tokens=remote_prefill_cached_tokens,
+            prefill_only=(
+                request.sampling_params is not None
+                and request.sampling_params.prefill_only
+            ),
         )
         if state.stats is not None and sampling_params is not None:
             state.stats.is_watermarked = bool(sampling_params.watermarking)
@@ -376,7 +386,7 @@ class RequestState:
                 error=error,
             )
 
-        if self.stream_interval > 1:
+        if self.stream_interval > 1 and not self.prefill_only:
             assert self.detokenizer is not None
 
             # Send output request only when
@@ -445,14 +455,18 @@ class RequestState:
                 finished=finished,
                 error=error,
             )
-        assert self.logprobs_processor is not None
-        if self.output_kind == RequestOutputKind.DELTA:
+        if self.prefill_only:
+            prompt_logprobs = None
+            prompt_token_id_logprobs = None
+        elif self.output_kind == RequestOutputKind.DELTA:
+            assert self.logprobs_processor is not None
             # Side effect: logprobs processor forgets prompt logprobs
             prompt_logprobs = self.logprobs_processor.pop_prompt_logprobs()
             prompt_token_id_logprobs = (
                 self.logprobs_processor.pop_prompt_token_id_logprobs()
             )
         else:
+            assert self.logprobs_processor is not None
             prompt_logprobs = self.logprobs_processor.prompt_logprobs
             prompt_token_id_logprobs = self.logprobs_processor.prompt_token_id_logprobs
 
@@ -478,6 +492,17 @@ class RequestState:
         finish_reason: FinishReason | None,
         stop_reason: int | str | None,
     ) -> CompletionOutput:
+        if self.prefill_only:
+            assert not token_ids
+            return CompletionOutput(
+                index=self.request_index,
+                text="",
+                token_ids=[],
+                cumulative_logprob=None,
+                logprobs=None,
+                finish_reason=str(finish_reason) if finish_reason is not None else None,
+                stop_reason=stop_reason,
+            )
         assert self.detokenizer is not None
         assert self.logprobs_processor is not None
         finished = finish_reason is not None
@@ -641,7 +666,7 @@ class OutputProcessor:
                         # Set pooling_output is not None to
                         # correctly enter the abort pooling branch
                         pooling_output=EMPTY_CPU_TENSOR
-                        if req_state.detokenizer is None
+                        if req_state.detokenizer is None and not req_state.prefill_only
                         else None,
                         finish_reason=FinishReason.ABORT,
                         stop_reason=None,
@@ -815,7 +840,7 @@ class OutputProcessor:
                 )
                 pooling_output = EMPTY_CPU_TENSOR
 
-            if pooling_output is None:
+            if pooling_output is None and not req_state.prefill_only:
                 assert req_state.detokenizer is not None
                 assert req_state.logprobs_processor is not None
                 if new_token_ids and weight_version is not None:
@@ -977,6 +1002,8 @@ class OutputProcessor:
             SpanAttributes.GEN_AI_LATENCY_TIME_IN_MODEL_INFERENCE: inference_time,
             SpanAttributes.GEN_AI_REQUEST_ID: req_state.external_req_id,
         }
+        if req_state.prefill_only:
+            attributes.pop(SpanAttributes.GEN_AI_LATENCY_TIME_TO_FIRST_TOKEN)
 
         # Add optional request parameters
         if req_state.top_p:
@@ -1019,6 +1046,7 @@ class OutputProcessor:
             req_state.stats,
             self.lora_states,
             req_state.lora_name,
+            prefill_only=req_state.prefill_only,
         )
 
     def _update_stats_from_finished(
