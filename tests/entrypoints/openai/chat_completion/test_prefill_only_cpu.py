@@ -1,9 +1,9 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
-"""CPU checks of the actual endpoint bodies without importing CUDA modules.
+"""CPU checks for zero-token chat through the real FastAPI route.
 
-The renderer and engine are boundary spies; request validation, API methods,
-route decorators, authentication and ASGI transport execute real code.
+The renderer and engine are boundary spies, and the request model fixture
+provides the fields needed by the serving methods without importing vLLM.
 """
 
 import ast
@@ -18,7 +18,6 @@ from unittest.mock import AsyncMock, Mock
 import httpx
 import pytest
 from fastapi import APIRouter, FastAPI, Request
-from pydantic import ValidationError
 
 SOURCE = Path(__file__).resolve().parents[4]
 
@@ -34,8 +33,7 @@ def load_nodes(relative, names, namespace, owner=None):
 
 
 @pytest.fixture
-def api(monkeypatch):
-    monkeypatch.setenv("MALLOW_ENABLE_PREFILL_ENDPOINT", "1")
+def api():
     ns = dict(globals())
     for relative in (
         "vllm/entrypoints/serve/engine/protocol.py",
@@ -73,6 +71,15 @@ def api(monkeypatch):
         logger=SimpleNamespace(debug=lambda *a: None, error=Mock()),
         _REMOVED_GUIDED_FIELDS=frozenset(),
         RequestOutput=Any,
+        DeltaMessage=Any,
+        FunctionCall=Any,
+        Logprob=Any,
+        OpenAIAnnotation=Any,
+        OpenAIChatCompletionAudio=Any,
+        PerRequestMetrics=Any,
+        ToolCall=Any,
+        WeightVersionSpan=Any,
+        _T=Any,
         ConversationMessage=Any,
         EngineInput=Any,
         CompletionRequest=Any,
@@ -105,6 +112,22 @@ def api(monkeypatch):
         cache_salt: str | None = None
         tools: list | None = None
         chat_template_kwargs: dict | None = None
+        add_generation_prompt: bool = True
+        max_completion_tokens: int | None = None
+        max_tokens: int | None = None
+        n: int | None = 1
+        stream: bool | None = False
+        use_beam_search: bool = False
+        min_tokens: int = 0
+        logprobs: bool | None = False
+        top_logprobs: int | None = 0
+        prompt_logprobs: int | None = None
+        logprob_token_ids: list[int] | None = None
+        echo: bool = False
+        kv_transfer_params: dict | None = None
+        ec_transfer_params: dict | None = None
+        return_token_ids: bool | None = None
+        return_prompt_text: bool | None = None
 
     ns["ChatCompletionRequest"] = ChatCompletionRequest
     load_nodes(
@@ -114,7 +137,16 @@ def api(monkeypatch):
     )
     load_nodes(
         "vllm/entrypoints/openai/chat_completion/protocol.py",
-        {"ChatPrefillRequest", "ChatPrefillResponse"},
+        {
+            "ChatMessage",
+            "ChatCompletionLogProb",
+            "ChatCompletionLogProbsContent",
+            "ChatCompletionLogProbs",
+            "ChatCompletionResponseChoice",
+            "ChatCompletionResponse",
+            "ChatCompletionResponseStreamChoice",
+            "ChatCompletionStreamResponse",
+        },
         ns,
     )
     load_nodes(
@@ -122,38 +154,48 @@ def api(monkeypatch):
         {"_make_prompt_tokens_details"},
         ns,
     )
+    serving_methods = {
+        "create_chat_completion",
+        "_create_chat_completion",
+        "_create_chat_prefill",
+        "_create_chat_message",
+        "get_chat_request_role",
+        "render_chat_request",
+    }
     load_nodes(
         "vllm/entrypoints/openai/chat_completion/serving.py",
-        {"create_chat_prefill", "render_chat_request"},
+        serving_methods,
         ns,
         owner="OpenAIServingChat",
     )
-    load_nodes(
-        "vllm/entrypoints/generate/base/serving.py",
-        {
-            "_get_session_id",
-            "_get_session_id_from_headers",
-            "_get_priority",
-            "_get_data_parallel_rank",
-        },
-        ns,
-        owner="GenerateBaseServing",
-    )
-    ns.update(SESSION_ID_HEADER="X-Session-ID", PRIORITY_HEADER="X-Vllm-Priority")
-    helper_names = (
+    helper_names = {
         "_get_session_id",
         "_get_session_id_from_headers",
         "_get_priority",
         "_get_data_parallel_rank",
+        "_with_kv_transfer_rejection_cleanup",
+    }
+    load_nodes(
+        "vllm/entrypoints/generate/base/serving.py",
+        helper_names,
+        ns,
+        owner="GenerateBaseServing",
     )
+    ns.update(SESSION_ID_HEADER="X-Session-ID", PRIORITY_HEADER="X-Vllm-Priority")
     helpers = type("GenerateBaseServing", (), {name: ns[name] for name in helper_names})
     ns["GenerateBaseServing"] = helpers
     serving_type = type(
         "PrefillServing",
         (helpers,),
-        {name: ns[name] for name in ("create_chat_prefill", "render_chat_request")},
+        {name: ns[name] for name in serving_methods},
     )
     serving = serving_type()
+    serving.has_kv_connector = False
+    serving.response_role = "assistant"
+    serving.system_fingerprint = None
+    serving.renderer = SimpleNamespace(tokenizer=object())
+    serving.parser_cls = None
+    serving._effective_chat_template_kwargs = lambda request: {}
     serving.input_processor = SimpleNamespace(validate_prefill_only_config=Mock())
     serving._check_model = AsyncMock(return_value=None)
     serving._preflight = Mock()
@@ -178,6 +220,8 @@ def api(monkeypatch):
         outputs=[SimpleNamespace(token_ids=[], text="", finish_reason="stop")],
         num_cached_tokens=2,
         num_cache_creation_tokens=1,
+        prompt_token_ids=prompt["prompt_token_ids"],
+        prompt="hello",
     )
     calls = []
     events = []
@@ -201,7 +245,8 @@ def api(monkeypatch):
 
 
 def body(api, **fields):
-    return api.ns["ChatPrefillRequest"](
+    fields.setdefault("max_completion_tokens", 0)
+    return api.ns["ChatCompletionRequest"](
         messages=[{"role": "user", "content": "hello"}], **fields
     )
 
@@ -214,9 +259,12 @@ async def test_prefill_uses_chat_renderer_and_returns_numeric_zero_output_ack(ap
         cache_salt="private",
         chat_template_kwargs={"enable_thinking": False},
     )
-    result = await api.serving.create_chat_prefill(request)
-    assert result.object == "chat.prefill"
-    assert result.status == "completed"
+    result = await api.serving.create_chat_completion(request)
+    assert result.object == "chat.completion"
+    assert len(result.choices) == 1
+    choice = result.choices[0]
+    assert (choice.message.role, choice.message.content) == ("assistant", "")
+    assert choice.finish_reason == "length"
     assert result.usage.model_dump(exclude_none=True) == {
         "prompt_tokens": 3,
         "total_tokens": 3,
@@ -229,7 +277,6 @@ async def test_prefill_uses_chat_renderer_and_returns_numeric_zero_output_ack(ap
     assert args[1].prefill_only and not args[1].detokenize
     assert not args[1].watermarking and args[1].output_kind == "final"
     assert api.events == ["closed"]
-    assert "choices" not in result.model_dump()
 
 
 @pytest.mark.asyncio
@@ -244,7 +291,7 @@ async def test_prefill_preserves_session_priority_and_trace_headers(api):
             ],
         }
     )
-    result = await api.serving.create_chat_prefill(body(api), raw)
+    result = await api.serving.create_chat_completion(body(api), raw)
     _, kwargs = api.calls[0]
     assert kwargs == dict(
         lora_request=None,
@@ -261,33 +308,31 @@ async def test_prefill_preserves_session_priority_and_trace_headers(api):
     [
         {"stream": True},
         {"n": 2},
-        {"max_tokens": 1},
-        {"max_completion_tokens": 1},
         {"use_beam_search": True},
         {"min_tokens": 1},
         {"logprobs": True},
         {"top_logprobs": 1},
         {"prompt_logprobs": 0},
+        {"logprob_token_ids": [1]},
         {"echo": True},
         {"kv_transfer_params": {"do_remote_prefill": True}},
+        {"ec_transfer_params": {}},
     ],
 )
-def test_prefill_rejects_generation_or_remote_transfer_requests(api, fields):
-    with pytest.raises(ValidationError):
-        body(api, **fields)
+@pytest.mark.asyncio
+async def test_prefill_rejects_generation_or_remote_transfer_requests(api, fields):
+    result = await api.serving.create_chat_completion(body(api, **fields))
+    assert result.error.code == 400
+    api.serving.online_renderer.render_chat.assert_not_awaited()
+    assert not api.calls
 
 
 @pytest.mark.asyncio
-async def test_disabled_endpoint_and_unsupported_config_never_render_or_enqueue(
-    api, monkeypatch
-):
-    monkeypatch.delenv("MALLOW_ENABLE_PREFILL_ENDPOINT")
-    assert (await api.serving.create_chat_prefill(body(api))).error.code == 404
-    monkeypatch.setenv("MALLOW_ENABLE_PREFILL_ENDPOINT", "1")
+async def test_unsupported_config_never_renders_or_enqueues(api):
     api.serving.input_processor.validate_prefill_only_config.side_effect = api.ns[
         "VLLMValidationError"
     ]("unsupported")
-    assert (await api.serving.create_chat_prefill(body(api))).error.code == 400
+    assert (await api.serving.create_chat_completion(body(api))).error.code == 400
     api.serving.online_renderer.render_chat.assert_not_awaited()
     assert not api.calls
 
@@ -296,7 +341,7 @@ async def test_disabled_endpoint_and_unsupported_config_never_render_or_enqueue(
 async def test_model_or_render_rejection_never_enqueues(api):
     rejected = api.serving.create_error_response("unknown model")
     api.serving._check_model.return_value = rejected
-    assert await api.serving.create_chat_prefill(body(api)) is rejected
+    assert await api.serving.create_chat_completion(body(api)) is rejected
     api.serving.online_renderer.render_chat.assert_not_awaited()
     assert not api.calls
 
@@ -305,7 +350,7 @@ async def test_model_or_render_rejection_never_enqueues(api):
 async def test_render_rejection_never_enqueues(api):
     rejected = api.serving.create_error_response("invalid prompt")
     api.serving.online_renderer.render_chat.return_value = rejected
-    assert await api.serving.create_chat_prefill(body(api)) is rejected
+    assert await api.serving.create_chat_completion(body(api)) is rejected
     assert not api.calls
 
 
@@ -322,13 +367,14 @@ async def test_prefill_never_reports_success_for_generated_or_incomplete_output(
         api.terminal.finished = False
     else:
         api.terminal.outputs = []
-    result = await api.serving.create_chat_prefill(body(api))
+    result = await api.serving.create_chat_completion(body(api))
     assert result.error.code == 500
     assert api.events == ["closed"]
 
 
 def make_app(api):
     ns = api.ns
+    ns.update(_ERROR_REF={"$ref": "#/components/schemas/ErrorResponse"})
     load_nodes(
         "vllm/entrypoints/serve/utils/api_utils.py",
         {
@@ -337,13 +383,19 @@ def make_app(api):
             "load_aware_call",
             "decrement_server_load",
             "validate_json_request",
+            "_sse_event_schema",
+            "json_or_sse_responses",
         },
         ns,
     )
-    ns["router"] = APIRouter()
+    ns.update(
+        router=APIRouter(),
+        metrics_header=lambda _: {},
+        ENDPOINT_LOAD_METRICS_FORMAT_HEADER_LABEL="endpoint-load-metrics-format",
+    )
     load_nodes(
         "vllm/entrypoints/openai/chat_completion/api_router.py",
-        {"chat", "create_chat_prefill"},
+        {"chat", "create_chat_completion"},
         ns,
     )
     ns["GUARDED_PREFIX"] = ("/v1", "/v2", "/inference", "/cohere")
@@ -360,22 +412,66 @@ def make_app(api):
     return app
 
 
+@pytest.mark.parametrize(
+    "fields",
+    [
+        {"max_completion_tokens": 0},
+        {"max_completion_tokens": 0, "max_tokens": 16},
+        {"max_tokens": 0},
+        {"max_completion_tokens": None, "max_tokens": 0},
+    ],
+)
 @pytest.mark.asyncio
-async def test_real_route_authentication_and_load_counter(api):
+async def test_real_chat_route_authentication_and_zero_token_response(api, fields):
     app = make_app(api)
     async with httpx.AsyncClient(
         transport=httpx.ASGITransport(app=app), base_url="http://local"
     ) as client:
-        payload = {"messages": [{"role": "user", "content": "hello"}]}
-        assert (await client.post("/v1/chat/prefill", json=payload)).status_code == 401
+        payload = {"messages": [{"role": "user", "content": "hello"}], **fields}
+        assert (
+            await client.post("/v1/chat/completions", json=payload)
+        ).status_code == 401
         response = await client.post(
-            "/v1/chat/prefill",
+            "/v1/chat/completions",
             json=payload,
             headers={"Authorization": "Bearer local-fixture"},
         )
     assert response.status_code == 200
     assert response.json()["usage"]["completion_tokens"] == 0
+    assert response.json()["choices"][0]["message"]["content"] == ""
     assert app.state.server_load_metrics == 0
+    assert len(api.calls) == 1 and api.calls[0][0][1].prefill_only
+
+
+@pytest.mark.parametrize(
+    "fields",
+    [
+        {},
+        {"max_completion_tokens": None},
+        {"max_completion_tokens": 1},
+        {"max_completion_tokens": 1, "max_tokens": 0},
+        {"max_tokens": 1},
+    ],
+)
+@pytest.mark.asyncio
+async def test_regular_chat_requests_do_not_enter_prefill(api, fields):
+    request = api.ns["ChatCompletionRequest"](messages=[], **fields)
+    rejection = api.serving.create_error_response("stop at render boundary")
+    api.serving.online_renderer.render_chat.return_value = rejection
+
+    assert await api.serving.create_chat_completion(request) is rejection
+    api.serving.input_processor.validate_prefill_only_config.assert_not_called()
+    assert not api.calls
+
+
+def test_dedicated_prefill_route_is_removed():
+    tree = ast.parse(
+        (SOURCE / "vllm/entrypoints/openai/chat_completion/api_router.py").read_text()
+    )
+    assert not any(
+        isinstance(node, ast.Constant) and node.value == "/v1/chat/prefill"
+        for node in ast.walk(tree)
+    )
 
 
 @pytest.mark.asyncio
@@ -392,7 +488,7 @@ async def test_disconnect_cancels_engine_iteration_and_closes_generator(api):
             closed.set()
 
     api.serving.engine_client.generate = wait_for_engine
-    task = asyncio.create_task(api.serving.create_chat_prefill(body(api)))
+    task = asyncio.create_task(api.serving.create_chat_completion(body(api)))
     await started.wait()
     task.cancel()
     with pytest.raises(asyncio.CancelledError):
@@ -423,7 +519,9 @@ async def test_asgi_disconnect_cancels_engine_and_releases_load_counter(api):
             sent_body = True
             return {
                 "type": "http.request",
-                "body": json.dumps({"messages": []}).encode(),
+                "body": json.dumps(
+                    {"messages": [], "max_completion_tokens": 0}
+                ).encode(),
                 "more_body": False,
             }
         await started.wait()
@@ -439,7 +537,7 @@ async def test_asgi_disconnect_cancels_engine_and_releases_load_counter(api):
         "http_version": "1.1",
         "method": "POST",
         "scheme": "http",
-        "path": "/v1/chat/prefill",
+        "path": "/v1/chat/completions",
         "query_string": b"",
         "root_path": "",
         "headers": [

@@ -196,6 +196,20 @@ The following extra parameters are supported:
     --8<-- "vllm/entrypoints/openai/chat_completion/protocol.py:chat-completion-extra-params"
     ```
 
+#### Zero-token prefill (Mallow fork)
+
+With `MALLOW_ENABLE_PREFILL_ENDPOINT=1`, send a non-streaming request to
+`POST /v1/chat/completions` with `max_completion_tokens: 0` to warm the
+prefix cache. The legacy field `max_tokens: 0` also works when
+`max_completion_tokens` is omitted or null. Use the same messages, chat-template
+options, and cache salt as the request that will reuse the prefix.
+
+The server returns a chat completion with empty content and
+`usage.completion_tokens: 0` after prefill finishes. This mode requires the
+supported single-rank V2 text-only setup with prefix caching enabled.
+Streaming, multiple choices, beam search, logprobs, echo, and remote cache
+transfer are unsupported. The old `/v1/chat/prefill` route has been removed.
+
 ### Responses API
 
 Our Responses API is compatible with [OpenAI's Responses API](https://platform.openai.com/docs/api-reference/responses);
