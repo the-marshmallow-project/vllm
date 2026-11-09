@@ -569,7 +569,7 @@ def admission(engine):
     proc.model_config = NS(
         is_encoder_decoder=False, is_diffusion=False, enable_prompt_embeds=False
     )
-    proc.cache_config = NS(kv_sharing_fast_prefill=False)
+    proc.cache_config = NS(enable_prefix_caching=True, kv_sharing_fast_prefill=False)
     proc.speculative_config = None
     proc.vllm_config = NS(
         use_v2_model_runner=True,
@@ -594,6 +594,7 @@ def admission(engine):
         ("model_config", "is_diffusion", True),
         ("vllm_config", "watermark_config", object()),
         ("cache_config", "kv_sharing_fast_prefill", True),
+        ("cache_config", "enable_prefix_caching", False),
         ("parallel", "tensor_parallel_size", 2),
         ("parallel", "pipeline_parallel_size", 2),
         ("parallel", "data_parallel_size", 2),
@@ -602,9 +603,8 @@ def admission(engine):
     ],
 )
 def test_admission_rejects_unsupported_modes_before_core_queue(
-    engine, monkeypatch, owner, name, value
+    engine, owner, name, value
 ):
-    monkeypatch.setenv("MALLOW_ENABLE_PREFILL_ENDPOINT", "1")
     proc = admission(engine)
     proc.validate_prefill_only_config()
     target = (
@@ -617,12 +617,11 @@ def test_admission_rejects_unsupported_modes_before_core_queue(
         proc.validate_prefill_only_config()
 
 
-def test_admission_requires_optin_and_compatible_speculator(engine, monkeypatch):
+def test_admission_without_optin_still_requires_compatible_speculator(
+    engine, monkeypatch
+):
     proc = admission(engine)
-    monkeypatch.delenv("MALLOW_ENABLE_PREFILL_ENDPOINT", raising=False)
-    with pytest.raises(ValidationError):
-        proc.validate_prefill_only_config()
-    monkeypatch.setenv("MALLOW_ENABLE_PREFILL_ENDPOINT", "1")
+    proc.validate_prefill_only_config()
     proc.speculative_config = NS(
         use_gemma4_mtp=lambda: True,
         draft_sample_method="greedy",

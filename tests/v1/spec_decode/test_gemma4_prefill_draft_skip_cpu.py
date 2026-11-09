@@ -184,7 +184,7 @@ def test_one_token_batch_skips_mtp_and_lookup_and_clears_drafts(
 def test_explicit_prefill_bypasses_drafting_independently_of_output_sentinel(
     make_speculator,
 ):
-    spec, batch, states, lookup = make_speculator(limits=(20, 20, 20, 20))
+    spec, batch, states, lookup = make_speculator(limits=(20, 20, 20, 20), flag=None)
     states.prefill_only = np.array([True, False, False, False])
     spec.attach_request_states(states)
     result = propose(spec, batch, sampled=0)
@@ -193,18 +193,17 @@ def test_explicit_prefill_bypasses_drafting_independently_of_output_sentinel(
     assert lookup.call_args.args[2].tolist() == [1]
 
 
-def test_endpoint_opt_in_enables_required_draft_compaction(
-    make_speculator, monkeypatch
-):
-    monkeypatch.setenv("MALLOW_ENABLE_PREFILL_ENDPOINT", "1")
-    spec, batch, _, lookup = make_speculator(flag=None)
-    assert not propose(spec, batch).any()
+def test_homogeneous_explicit_prefill_skips_drafts_without_opt_in(make_speculator):
+    spec, batch, states, lookup = make_speculator(flag=None)
+    states.prefill_only = np.array([True, True, False, False])
+    spec.attach_request_states(states)
+    assert not propose(spec, batch, sampled=0).any()
     assert spec.calls == []
     lookup.assert_not_called()
 
 
 def test_explicit_prefill_never_falls_back_to_unsupported_proposal(make_speculator):
-    spec, batch, states, lookup = make_speculator(flag=None)
+    spec, batch, states, lookup = make_speculator(flag=None, adaptive=True)
     states.prefill_only = np.array([True, False, False, False])
     spec.attach_request_states(states)
     with pytest.raises(RuntimeError, match="cannot enter draft proposal"):

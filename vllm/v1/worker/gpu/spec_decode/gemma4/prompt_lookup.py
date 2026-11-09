@@ -18,8 +18,9 @@ lossless, and every batch keeps its shape for CUDA graphs.
 
 Off unless `MALLOW_PROMPT_LOOKUP_MAX` is set; see `gemma4_speculator_class`.
 
-`MALLOW_SKIP_PREFILL_DRAFT=1` opts into bypassing proposals for one-token requests
-on a single rank. Mixed text batches draft only their remaining requests using
+Zero-token prefill bypasses proposals on a single rank.
+`MALLOW_SKIP_PREFILL_DRAFT=1` also bypasses proposals for one-token requests.
+Mixed text batches draft only their remaining requests using
 independent Q-only queries against the target's frozen KV cache. Unsupported
 input modes and dummy/profile runs retain their original proposal path.
 """
@@ -239,12 +240,11 @@ class Gemma4PromptLookupSpeculator(Gemma4Speculator):
         self.max_seq_len_np: np.ndarray | None = None
         self.prefill_only_np: np.ndarray | None = None
         parallel = vllm_config.parallel_config
+        self.skip_single_token_draft = (
+            os.environ.get("MALLOW_SKIP_PREFILL_DRAFT") == "1"
+        )
         self.skip_prefill_draft = (
-            (
-                os.environ.get("MALLOW_SKIP_PREFILL_DRAFT") == "1"
-                or os.environ.get("MALLOW_ENABLE_PREFILL_ENDPOINT") == "1"
-            )
-            and parallel.tensor_parallel_size == 1
+            parallel.tensor_parallel_size == 1
             and parallel.pipeline_parallel_size == 1
             and parallel.data_parallel_size == 1
             and parallel.prefill_context_parallel_size == 1
@@ -332,6 +332,7 @@ class Gemma4PromptLookupSpeculator(Gemma4Speculator):
         )
         if (
             self.skip_prefill_draft
+            and (explicit_prefill or self.skip_single_token_draft)
             and not dummy_run
             and not is_profile
             and dp_sync_state is None
@@ -353,12 +354,16 @@ class Gemma4PromptLookupSpeculator(Gemma4Speculator):
                 and np.all(indices < len(self.prompt_len_np))
                 and np.all(indices < len(self.max_seq_len_np))
             ):
-                one_token = (
-                    self.max_seq_len_np[indices] - self.prompt_len_np[indices] == 1
+                skip_draft = (
+                    prefill_only_np[indices]
+                    if prefill_only_np is not None
+                    else np.zeros(len(indices), dtype=bool)
                 )
-                if prefill_only_np is not None:
-                    one_token |= prefill_only_np[indices]
-                if np.all(one_token):
+                if self.skip_single_token_draft:
+                    skip_draft |= (
+                        self.max_seq_len_np[indices] - self.prompt_len_np[indices] == 1
+                    )
+                if np.all(skip_draft):
                     out = self.lookup_drafts[: input_batch.num_reqs]
                     out.zero_()
                     self.draft_tokens[: input_batch.num_reqs].zero_()
@@ -367,7 +372,7 @@ class Gemma4PromptLookupSpeculator(Gemma4Speculator):
                     ] = 0
                     return out
                 if (
-                    np.any(one_token)
+                    np.any(skip_draft)
                     and can_compact_gemma4_prefill(
                         getattr(self, "model_state", None),
                         self.vllm_config.model_config,
@@ -375,7 +380,7 @@ class Gemma4PromptLookupSpeculator(Gemma4Speculator):
                     and input_batch.positions.ndim == 1
                     and getattr(input_batch, "fast_prefill", None) is None
                 ):
-                    active_rows = np.flatnonzero(~one_token)
+                    active_rows = np.flatnonzero(~skip_draft)
                     draft = self.propose_for_active_requests(
                         input_batch,
                         active_rows,
@@ -388,7 +393,7 @@ class Gemma4PromptLookupSpeculator(Gemma4Speculator):
                         seeds,
                         mtp_steps,
                     )
-                    prefill_indices = indices[one_token]
+                    prefill_indices = indices[skip_draft]
                     self.prefill_req_indices[: len(prefill_indices)].copy_(
                         torch.from_numpy(prefill_indices), non_blocking=True
                     )
