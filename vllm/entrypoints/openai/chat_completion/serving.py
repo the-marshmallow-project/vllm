@@ -3,7 +3,6 @@
 
 import asyncio
 import itertools
-import os
 import time
 from collections.abc import AsyncGenerator, AsyncIterator
 from collections.abc import Sequence as GenericSequence
@@ -40,8 +39,6 @@ from vllm.entrypoints.openai.chat_completion.protocol import (
     ChatCompletionResponseStreamChoice,
     ChatCompletionStreamResponse,
     ChatMessage,
-    ChatPrefillRequest,
-    ChatPrefillResponse,
 )
 from vllm.entrypoints.openai.chat_completion.stream_processor import (
     ChatStreamProcessor,
@@ -288,15 +285,35 @@ class OpenAIServingChat(GenerateBaseServing):
 
         return await self.online_renderer.render_chat(request)
 
-    async def create_chat_prefill(
+    async def _create_chat_prefill(
         self,
-        request: ChatPrefillRequest,
-        raw_request: Request | None = None,
-    ) -> ChatPrefillResponse | ErrorResponse:
-        if os.getenv("MALLOW_ENABLE_PREFILL_ENDPOINT", "0") != "1":
+        request: ChatCompletionRequest,
+        raw_request: Request | None,
+    ) -> ChatCompletionResponse | ErrorResponse:
+        if request.stream or request.n not in (None, 1):
             return self.create_error_response(
-                "The dev prefill endpoint is disabled.",
-                status_code=HTTPStatus.NOT_FOUND,
+                "Zero-token chat completions require stream=false and n=1."
+            )
+        if (
+            request.use_beam_search
+            or request.min_tokens != 0
+            or request.logprobs
+            or request.top_logprobs not in (None, 0)
+            or request.prompt_logprobs is not None
+            or request.logprob_token_ids is not None
+            or request.echo
+        ):
+            return self.create_error_response(
+                "Zero-token chat completions do not support beam search, "
+                "positive min_tokens, logprobs, or echo."
+            )
+        if (
+            request.kv_transfer_params is not None
+            or request.ec_transfer_params is not None
+        ):
+            return self.create_error_response(
+                "Zero-token chat completions do not support KV or encoder cache "
+                "transfer."
             )
         try:
             self.input_processor.validate_prefill_only_config()
@@ -374,10 +391,25 @@ class OpenAIServingChat(GenerateBaseServing):
             ),
         )
         request_metadata.final_usage_info = usage
-        return ChatPrefillResponse(
+        return ChatCompletionResponse(
             id=request_id,
             model=self.models.model_name(lora_request),
+            choices=[
+                ChatCompletionResponseChoice(
+                    index=0,
+                    message=self._create_chat_message(
+                        role=self.get_chat_request_role(request), content=""
+                    ),
+                    finish_reason="length",
+                    token_ids=[] if request.return_token_ids else None,
+                )
+            ],
             usage=usage,
+            system_fingerprint=self.system_fingerprint,
+            prompt_token_ids=(
+                final_res.prompt_token_ids if request.return_token_ids else None
+            ),
+            prompt_text=final_res.prompt if request.return_prompt_text else None,
         )
 
     async def create_chat_completion(
@@ -400,6 +432,14 @@ class OpenAIServingChat(GenerateBaseServing):
         request: ChatCompletionRequest,
         raw_request: Request | None = None,
     ) -> AsyncGenerator[str, None] | ChatCompletionResponse | ErrorResponse:
+        requested_max_tokens = (
+            request.max_completion_tokens
+            if request.max_completion_tokens is not None
+            else request.max_tokens
+        )
+        if requested_max_tokens == 0:
+            return await self._create_chat_prefill(request, raw_request)
+
         # Streaming response
         tokenizer = self.renderer.tokenizer
         assert tokenizer is not None
@@ -444,9 +484,7 @@ class OpenAIServingChat(GenerateBaseServing):
 
             max_tokens = get_max_tokens(
                 max_model_len,
-                request.max_completion_tokens
-                if request.max_completion_tokens is not None
-                else request.max_tokens,
+                requested_max_tokens,
                 self._extract_prompt_len(engine_input),
                 self.default_sampling_params,
                 self.override_max_tokens,
