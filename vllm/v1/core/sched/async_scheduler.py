@@ -22,7 +22,7 @@ class AsyncScheduler(Scheduler):
         spec_token_placeholders = [-1] * scheduler_output.num_spec_tokens_to_schedule
         for req_id in scheduler_output.num_scheduled_tokens:
             request = self.requests[req_id]
-            if request.is_prefill_chunk:
+            if request.is_prefill_chunk or request.prefill_only:
                 continue
 
             scheduler_output.pending_structured_output_tokens |= (

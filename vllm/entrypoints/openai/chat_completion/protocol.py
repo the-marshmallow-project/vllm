@@ -1139,6 +1139,33 @@ class ChatCompletionRequest(OpenAIBaseModel):
         return data
 
 
+class ChatPrefillRequest(ChatCompletionRequest):
+    """Render the same chat prompt, then finish without generating tokens."""
+
+    stream: Literal[False] = False
+    n: Literal[1] = 1
+    max_tokens: Literal[0] | None = None
+    max_completion_tokens: Literal[0] | None = None
+    use_beam_search: Literal[False] = False
+    min_tokens: Literal[0] = 0
+    logprobs: Literal[False] | None = False
+    top_logprobs: Literal[0] | None = 0
+    prompt_logprobs: None = None
+    logprob_token_ids: None = None
+    echo: Literal[False] = False
+    kv_transfer_params: None = None
+    ec_transfer_params: None = None
+
+
+class ChatPrefillResponse(OpenAIBaseModel):
+    id: str
+    object: Literal["chat.prefill"] = "chat.prefill"
+    created: int = Field(default_factory=lambda: int(time.time()))
+    model: str
+    status: Literal["completed"] = "completed"
+    usage: UsageInfo
+
+
 class BatchChatCompletionRequest(OpenAIBaseModel):
     """Request model for the /v1/chat/completions/batch endpoint.
 

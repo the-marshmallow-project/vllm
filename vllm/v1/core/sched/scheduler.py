@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 import itertools
+import os
 import time
 from collections import defaultdict, deque
 from collections.abc import Iterable
@@ -134,6 +135,22 @@ class Scheduler(SchedulerInterface):
             if self.scheduler_config.max_num_active_seqs is not None
             else self.max_num_running_reqs
         )
+        self.reply_first = os.environ.get("MALLOW_REPLY_FIRST") == "1"
+        self.reply_first_prefill_slots = max(1, self.max_num_active_reqs // 4)
+        if self.reply_first:
+            if (
+                self.max_num_active_reqs < 2
+                or not self.scheduler_config.enable_chunked_prefill
+                or self.scheduler_config.prefill_schedule_interval != 1
+            ):
+                raise ValueError(
+                    "Reply-first needs chunked prefill, two active slots and "
+                    "the default native prefill interval"
+                )
+            logger.info(
+                "Reply-first scheduling enabled (%d warm-up slots)",
+                self.reply_first_prefill_slots,
+            )
         self.max_num_scheduled_tokens = (
             self.scheduler_config.max_num_scheduled_tokens
             if self.scheduler_config.max_num_scheduled_tokens is not None
@@ -708,6 +725,8 @@ class Scheduler(SchedulerInterface):
         Either finish the prefill or leave at least num_prefill_lookahead for
         the next chunk. No-op for eagle-family drafters (lookahead 1).
         """
+        if request.prefill_only:
+            return num_new_tokens
         remaining = request.num_tokens - num_computed_tokens - num_new_tokens
         if 0 < remaining < self.num_prefill_lookahead:
             num_new_tokens -= self.num_prefill_lookahead - remaining
@@ -806,11 +825,30 @@ class Scheduler(SchedulerInterface):
         ):
             defer_prefills = True
 
+        reply_work = self.reply_first and (
+            any(not request.prefill_only for request in self.running)
+            or any(
+                not request.prefill_only
+                and not self._is_blocked_waiting_status(request.status)
+                for request in itertools.chain(self.kv_holding_waiting, self.waiting)
+            )
+        )
+        # Aged warm-ups share a small allowance while replies need the GPU.
+        warmup_tokens = min(512, max(1, token_budget // 16))
+
         # First, schedule the RUNNING requests.
         req_index = 0
         while req_index < len(self.running) and token_budget > 0:
             request = self.running[req_index]
-            if input_budget <= draft_slots:
+            limit_warmup = reply_work and request.prefill_only
+            if limit_warmup and (
+                not warmup_tokens
+                or scheduled_timestamp - request.reply_first_queued_at < 1.0
+            ):
+                req_index += 1
+                continue
+            request_draft_slots = 0 if request.prefill_only else draft_slots
+            if input_budget <= request_draft_slots:
                 break
 
             if (
@@ -860,8 +898,11 @@ class Scheduler(SchedulerInterface):
             if 0 < long_prefill_token_threshold < num_new_tokens:
                 num_new_tokens = long_prefill_token_threshold
             num_new_tokens = min(
-                num_new_tokens, token_budget, input_budget - draft_slots
+                num_new_tokens, token_budget, input_budget - request_draft_slots
             )
+
+            if limit_warmup:
+                num_new_tokens = min(num_new_tokens, warmup_tokens)
 
             # Make sure the input position does not exceed the max model len.
             # This is necessary when using spec decoding.
@@ -869,7 +910,7 @@ class Scheduler(SchedulerInterface):
                 num_new_tokens,
                 self.max_model_len
                 - request.num_computed_tokens
-                - self.num_sampled_tokens_per_step,
+                - (0 if request.prefill_only else self.num_sampled_tokens_per_step),
             )
 
             # Apply Mamba alignment before encoder caps.
@@ -930,11 +971,17 @@ class Scheduler(SchedulerInterface):
                     new_blocks = self.kv_cache_manager.allocate_slots(
                         request,
                         num_new_tokens,
-                        num_lookahead_tokens=self.num_lookahead_tokens,
+                        num_lookahead_tokens=(
+                            0 if request.prefill_only else self.num_lookahead_tokens
+                        ),
                     )
 
                     if new_blocks is not None:
                         # The request can be scheduled.
+                        break
+
+                    if limit_warmup:
+                        # An aged warm-up may use spare blocks, not evict a reply.
                         break
 
                     if (
@@ -968,7 +1015,9 @@ class Scheduler(SchedulerInterface):
                             scheduled_running_reqs.remove(preempted_req)
                             restored = num_scheduled_tokens.pop(preempted_req_id)
                             token_budget += restored
-                            input_budget += restored + draft_slots
+                            input_budget += restored + (
+                                0 if preempted_req.prefill_only else draft_slots
+                            )
                             req_to_new_blocks.pop(preempted_req_id)
                             scheduled_spec_decode_tokens.pop(preempted_req_id, None)
                             preempted_encoder_inputs = scheduled_encoder_inputs.pop(
@@ -996,6 +1045,9 @@ class Scheduler(SchedulerInterface):
                         break
 
             if new_blocks is None:
+                if limit_warmup:
+                    req_index += 1
+                    continue
                 if (
                     self.policy == SchedulingPolicy.PRIORITY
                     and request.status == RequestStatus.PREEMPTED
@@ -1016,8 +1068,10 @@ class Scheduler(SchedulerInterface):
             req_to_new_blocks[request_id] = new_blocks
             num_scheduled_tokens[request_id] = num_new_tokens
             token_budget -= num_new_tokens
-            input_budget -= num_new_tokens + draft_slots
+            input_budget -= num_new_tokens + request_draft_slots
             req_index += 1
+            if limit_warmup:
+                warmup_tokens -= num_new_tokens
             drafts_needed = drafts_needed or not self._drafts_unused(
                 request, request.num_computed_tokens, num_new_tokens
             )
@@ -1073,9 +1127,19 @@ class Scheduler(SchedulerInterface):
             # Async loads started this step: newer than any block-holder.
             step_started_kv_loads: list[Request] = []
 
-            def skip_request(from_queue: RequestQueue) -> None:
+            warmup_slots = 0
+            if self.reply_first:
+                warmup_slots = sum(
+                    request.prefill_only
+                    for request in itertools.chain(self.running, self.kv_holding_waiting)
+                )
+
+            def skip_request(
+                from_queue: RequestQueue, *, track_capacity: bool = True
+            ) -> None:
                 request_to_skip = from_queue.pop_request()
-                self.deferred_waiting.add(request_to_skip)
+                if track_capacity:
+                    self.deferred_waiting.add(request_to_skip)
                 holds_blocks = self._holds_kv_blocks(request_to_skip)
                 if holds_blocks and from_queue is not self.kv_holding_waiting:
                     step_started_kv_loads.append(request_to_skip)
@@ -1107,17 +1171,37 @@ class Scheduler(SchedulerInterface):
                     request_queue = self.async_kv_waiting
                 else:
                     break
-                if not request_queue or (
-                    not loads_only and input_budget <= draft_slots
-                ):
+                if not request_queue:
                     break
 
                 request = request_queue.peek_request()
                 request_id = request.request_id
+                # Warm-ups verify no drafts, so they need no draft slots.
+                request_draft_slots = 0 if request.prefill_only else draft_slots
+                if not loads_only and input_budget <= request_draft_slots:
+                    break
 
                 ready_to_schedule = self._handle_blocked_waiting_request(request)
                 if not ready_to_schedule:
                     skip_request(request_queue)
+                    continue
+
+                new_warmup_slot = (
+                    self.reply_first
+                    and request.prefill_only
+                    and request_queue is not self.kv_holding_waiting
+                )
+                limit_warmup = reply_work and request.prefill_only
+                if (
+                    new_warmup_slot and warmup_slots >= self.reply_first_prefill_slots
+                ) or (
+                    limit_warmup
+                    and (
+                        not warmup_tokens
+                        or scheduled_timestamp - request.reply_first_queued_at < 1.0
+                    )
+                ):
+                    skip_request(request_queue, track_capacity=False)
                     continue
 
                 if request.num_stale_output_tokens and not request.drop_stale_output:
@@ -1384,7 +1468,11 @@ class Scheduler(SchedulerInterface):
                     # compute to a cadence-aligned step.
                     break
                 else:
-                    request_token_budget = min(token_budget, input_budget - draft_slots)
+                    request_token_budget = min(
+                        token_budget, input_budget - request_draft_slots
+                    )
+                    if limit_warmup:
+                        request_token_budget = min(request_token_budget, warmup_tokens)
                     if did_prefix_cache_lookup:
                         # Fresh admission: local and/or sync external hit.
                         num_replay_tokens = self._mark_prefix_replay(
@@ -1403,6 +1491,7 @@ class Scheduler(SchedulerInterface):
                     if (
                         (self.num_spec_tokens > 0 and self.dynamic_sd_lookup is None)
                         and self.num_sampled_tokens_per_step > 0
+                        and not request.prefill_only
                         and num_new_tokens == 1
                         and not prefill_scheduled
                         and (scheduled_running_reqs or num_computed_tokens > 0)
@@ -1506,7 +1595,9 @@ class Scheduler(SchedulerInterface):
                 # mismatching local and remote block counts.
                 limit_lookahead_tokens = load_kv_async and self.num_lookahead_tokens > 0
                 effective_lookahead_tokens = (
-                    0 if limit_lookahead_tokens else self.num_lookahead_tokens
+                    0
+                    if limit_lookahead_tokens or request.prefill_only
+                    else self.num_lookahead_tokens
                 )
 
                 # Determine if we need to allocate cross-attention blocks.
@@ -1565,7 +1656,13 @@ class Scheduler(SchedulerInterface):
                     # manager
                     if request.has_encoder_inputs:
                         self.encoder_cache_manager.free(request)
+                    if limit_warmup:
+                        skip_request(request_queue, track_capacity=False)
+                        continue
                     break
+
+                if new_warmup_slot:
+                    warmup_slots += 1
 
                 # KVTransfer: the connector uses this info to determine
                 # if a load is needed. Note that
@@ -1680,7 +1777,9 @@ class Scheduler(SchedulerInterface):
                 )
                 num_scheduled_tokens[request_id] = num_new_tokens
                 token_budget -= num_new_tokens
-                input_budget -= num_new_tokens + draft_slots
+                input_budget -= num_new_tokens + request_draft_slots
+                if limit_warmup:
+                    warmup_tokens -= num_new_tokens
                 request.status = RequestStatus.RUNNING
                 request.num_computed_tokens = num_computed_tokens
                 self._set_kv_fetch_stage(request, None)
@@ -2494,7 +2593,22 @@ class Scheduler(SchedulerInterface):
             status_before_stop = request.status
 
             # Check for stop and update request status.
-            if new_token_ids:
+            if request.prefill_only:
+                # Scheduled tokens are counted optimistically. Only completed
+                # writes from this incarnation may acknowledge a warm prompt.
+                new_token_ids = []
+                if (
+                    not output_is_stale
+                    and request.status == RequestStatus.RUNNING
+                    and request.num_computed_tokens - request.num_in_flight_tokens
+                    >= request.num_prompt_tokens
+                ):
+                    self.kv_cache_manager.cache_blocks(
+                        request, request.num_prompt_tokens
+                    )
+                    request.status = RequestStatus.FINISHED_STOPPED
+                    stopped = True
+            elif new_token_ids:
                 has_output_placeholders = request.num_output_placeholders > 0
                 new_token_ids, stopped = self._update_request_with_output(
                     request, new_token_ids, is_stale=output_is_stale
@@ -3050,7 +3164,7 @@ class Scheduler(SchedulerInterface):
                 # The request may have been finished. Skip.
                 continue
 
-            if request.is_prefill_chunk:
+            if request.is_prefill_chunk or request.prefill_only:
                 # Ignore draft tokens for prefill chunks.
                 if request.spec_token_ids:
                     request.spec_token_ids = []
@@ -3077,6 +3191,9 @@ class Scheduler(SchedulerInterface):
                 continue
 
             placeholder_spec_tokens = sched_spec_tokens.get(req_id)
+            if request.prefill_only:
+                sched_spec_tokens.pop(req_id, None)
+                continue
             if not placeholder_spec_tokens:
                 continue
 
@@ -3125,6 +3242,8 @@ class Scheduler(SchedulerInterface):
                 # Streaming-input session finished.
                 self.finish_requests(request.request_id, RequestStatus.FINISHED_ABORTED)
         else:
+            if self.reply_first and request.prefill_only:
+                request.reply_first_queued_at = time.monotonic()
             if request.resumable:
                 request.streaming_queue = deque()
             if self.connector is not None:

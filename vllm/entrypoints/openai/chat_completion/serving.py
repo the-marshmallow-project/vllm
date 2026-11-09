@@ -3,6 +3,7 @@
 
 import asyncio
 import itertools
+import os
 import time
 from collections.abc import AsyncGenerator, AsyncIterator
 from collections.abc import Sequence as GenericSequence
@@ -39,6 +40,8 @@ from vllm.entrypoints.openai.chat_completion.protocol import (
     ChatCompletionResponseStreamChoice,
     ChatCompletionStreamResponse,
     ChatMessage,
+    ChatPrefillRequest,
+    ChatPrefillResponse,
 )
 from vllm.entrypoints.openai.chat_completion.stream_processor import (
     ChatStreamProcessor,
@@ -55,7 +58,7 @@ from vllm.entrypoints.serve.utils.request_logger import RequestLogger
 from vllm.entrypoints.serve.utils.tool_calls_utils import (
     resolve_finish_reason,
 )
-from vllm.exceptions import GenerationError
+from vllm.exceptions import GenerationError, VLLMValidationError
 from vllm.inputs import EngineInput, MultiModalPlaceholders
 from vllm.logger import init_logger
 from vllm.logprobs import Logprob
@@ -67,7 +70,7 @@ from vllm.renderers.chat_utils import (
     ConversationMessage,
 )
 from vllm.renderers.online_renderer import OnlineRenderer
-from vllm.sampling_params import BeamSearchParams, SamplingParams
+from vllm.sampling_params import BeamSearchParams, RequestOutputKind, SamplingParams
 from vllm.tokenizers import TokenizerLike
 from vllm.utils.collection_utils import as_list
 from vllm.utils.gc_utils import untracked_list
@@ -284,6 +287,98 @@ class OpenAIServingChat(GenerateBaseServing):
         self._preflight(request.n or 1)
 
         return await self.online_renderer.render_chat(request)
+
+    async def create_chat_prefill(
+        self,
+        request: ChatPrefillRequest,
+        raw_request: Request | None = None,
+    ) -> ChatPrefillResponse | ErrorResponse:
+        if os.getenv("MALLOW_ENABLE_PREFILL_ENDPOINT", "0") != "1":
+            return self.create_error_response(
+                "The dev prefill endpoint is disabled.",
+                status_code=HTTPStatus.NOT_FOUND,
+            )
+        try:
+            self.input_processor.validate_prefill_only_config()
+        except VLLMValidationError as exc:
+            return self.create_error_response(str(exc))
+
+        result = await self.render_chat_request(request)
+        if isinstance(result, ErrorResponse):
+            return result
+        _, engine_inputs = result
+        if len(engine_inputs) != 1:
+            return self.create_error_response("Prefill requires exactly one prompt.")
+        (engine_input,) = engine_inputs
+        request_id = (
+            f"chatprefill-{self._base_request_id(raw_request, request.request_id)}"
+        )
+        request_metadata = RequestResponseMetadata(request_id=request_id)
+        if raw_request is not None:
+            raw_request.state.request_metadata = request_metadata
+        lora_request = self._maybe_get_adapters(request, supports_default_mm_loras=True)
+        sampling_params = SamplingParams(
+            prefill_only=True,
+            max_tokens=1,
+            detokenize=False,
+            watermarking=False,
+            output_kind=RequestOutputKind.FINAL_ONLY,
+        )
+        trace_headers = (
+            await self._get_trace_headers(raw_request.headers)
+            if raw_request is not None
+            else None
+        )
+        result_generator = self.engine_client.generate(
+            engine_input,
+            sampling_params,
+            request_id,
+            lora_request=lora_request,
+            trace_headers=trace_headers,
+            priority=self._get_priority(request, raw_request),
+            data_parallel_rank=self._get_data_parallel_rank(raw_request),
+            session_id=self._get_session_id(request, raw_request),
+        )
+        final_res: RequestOutput | None = None
+        try:
+            async for res in result_generator:
+                final_res = res
+        finally:
+            await result_generator.aclose()
+
+        if final_res is None or not final_res.finished:
+            return self.create_error_response(
+                "No completed prefill received from the engine.",
+                err_type="InternalServerError",
+                status_code=HTTPStatus.INTERNAL_SERVER_ERROR,
+            )
+        if len(final_res.outputs) != 1 or any(
+            output.token_ids or output.text or output.finish_reason != "stop"
+            for output in final_res.outputs
+        ):
+            return self.create_error_response(
+                "The engine did not complete a zero-output prefill.",
+                err_type="InternalServerError",
+                status_code=HTTPStatus.INTERNAL_SERVER_ERROR,
+            )
+        prompt_tokens = self._extract_prompt_len(engine_input)
+        usage = UsageInfo(
+            prompt_tokens=prompt_tokens,
+            completion_tokens=0,
+            total_tokens=prompt_tokens,
+            prompt_tokens_details=_make_prompt_tokens_details(
+                True,
+                final_res.num_cached_tokens,
+                final_res.num_cache_creation_tokens,
+                None,
+            ),
+        )
+        request_metadata.final_usage_info = usage
+        return ChatPrefillResponse(
+            id=request_id,
+            model=self.models.model_name(lora_request),
+            usage=usage,
+        )
 
     async def create_chat_completion(
         self,
