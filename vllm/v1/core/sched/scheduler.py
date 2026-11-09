@@ -1,7 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 import itertools
-import os
 import time
 from collections import defaultdict, deque
 from collections.abc import Iterable
@@ -135,18 +134,13 @@ class Scheduler(SchedulerInterface):
             if self.scheduler_config.max_num_active_seqs is not None
             else self.max_num_running_reqs
         )
-        self.reply_first = os.environ.get("MALLOW_REPLY_FIRST") == "1"
+        self.reply_first = (
+            self.max_num_active_reqs >= 2
+            and self.scheduler_config.enable_chunked_prefill
+            and self.scheduler_config.prefill_schedule_interval == 1
+        )
         self.reply_first_prefill_slots = max(1, self.max_num_active_reqs // 4)
         if self.reply_first:
-            if (
-                self.max_num_active_reqs < 2
-                or not self.scheduler_config.enable_chunked_prefill
-                or self.scheduler_config.prefill_schedule_interval != 1
-            ):
-                raise ValueError(
-                    "Reply-first needs chunked prefill, two active slots and "
-                    "the default native prefill interval"
-                )
             logger.info(
                 "Reply-first scheduling enabled (%d warm-up slots)",
                 self.reply_first_prefill_slots,

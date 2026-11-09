@@ -134,8 +134,8 @@ class InputProcessor:
         parallel = config.parallel_config
         model = self.model_config
         if (
-            os.environ.get("MALLOW_ENABLE_PREFILL_ENDPOINT") != "1"
-            or not config.use_v2_model_runner
+            not config.use_v2_model_runner
+            or not self.cache_config.enable_prefix_caching
             or any(
                 getattr(parallel, name) != 1
                 for name in (
@@ -154,8 +154,8 @@ class InputProcessor:
             or self.cache_config.kv_sharing_fast_prefill
         ):
             raise VLLMValidationError(
-                "prefill_only requires MALLOW_ENABLE_PREFILL_ENDPOINT=1, V2, one rank, "
-                "text-only autoregressive inputs, and no watermark or fast prefill"
+                "prefill_only requires V2, prefix caching, one rank, text-only "
+                "autoregressive inputs, and no watermark or fast prefill"
             )
         spec = self.speculative_config
         if spec is not None and (

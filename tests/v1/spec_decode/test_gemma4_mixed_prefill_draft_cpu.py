@@ -780,6 +780,7 @@ def test_public_mixed_proposal_excludes_prefill_from_model_and_lookup_then_scatt
     # to the same persistent tensors while the public subclass dispatches.
     proposal.__dict__ = runtime.__dict__
     proposal.num_slots = 15
+    proposal.skip_single_token_draft = not explicit_prefill
     proposal.compact_prefill_cudagraph_manager.owner = proposal
     proposal.prompt_len_np = np.arange(8, dtype=np.int32) * 100
     proposal.max_seq_len_np = proposal.prompt_len_np + 128
