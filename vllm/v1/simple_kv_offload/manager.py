@@ -270,6 +270,11 @@ class SimpleCPUOffloadScheduler:
             self._target_free = 0
         # GPU blocks with a CPU copy that the last lazy walk covered.
         self._walked_cpu_held: set[int] = set()
+        # Lazy mode: GPU blocks taken by async CPU loads this step, and their
+        # decaying peak. Loads allocate outside max_num_batched_tokens, so the
+        # walk also covers that peak.
+        self._lazy_step_load_blocks = 0
+        self._lazy_load_window = 0
         self._store_event_to_blocks: dict[int, TransferMeta] = {}
         self._abandoned_store_event_to_blocks: dict[int, TransferMeta] = {}
         # Eager mode only
@@ -406,6 +411,8 @@ class SimpleCPUOffloadScheduler:
             assert self._gpu_block_pool is not None
             self.cpu_block_pool.touch(cpu_blocks)
             self._gpu_block_pool.touch(gpu_blocks)
+            if self._lazy_mode:
+                self._lazy_step_load_blocks += len(gpu_blocks)
             assert request.request_id not in self._reqs_to_load
             self._reqs_to_load[request.request_id] = LoadRequestState(
                 request,
@@ -630,6 +637,8 @@ class SimpleCPUOffloadScheduler:
         self._gpu_block_pool.touch(
             [self._gpu_block_pool.blocks[bid] for bid in gpu_block_ids]
         )
+        if self._lazy_mode:
+            self._lazy_step_load_blocks += len(gpu_block_ids)
 
         assert self._reqs_to_load.get(req_id) is None
         self._reqs_to_load[req_id] = LoadRequestState(
@@ -729,7 +738,15 @@ class SimpleCPUOffloadScheduler:
         """Offload cached GPU blocks near eviction."""
         if self._gpu_block_pool is None or self._target_free <= 0:
             return [], [], [], None
-        gpu_ids, cpu_ids = self._offload_eviction_end(self._target_free)
+        # Hold the largest per-step load allocation, decaying it by 1/128 per
+        # step (rounded up, half-life ~90 steps), and cover it twice, as
+        # _target_free does the token budget: once for the step ahead and
+        # once while stores are in flight.
+        decayed = self._lazy_load_window - cdiv(self._lazy_load_window, 128)
+        self._lazy_load_window = max(self._lazy_step_load_blocks, decayed)
+        self._lazy_step_load_blocks = 0
+        target = self._target_free + 2 * self._lazy_load_window
+        gpu_ids, cpu_ids = self._offload_eviction_end(target)
         return gpu_ids, cpu_ids, [], None
 
     def _offload_eviction_end(self, num_blocks: int) -> tuple[list[int], list[int]]:
@@ -1589,6 +1606,8 @@ class SimpleCPUOffloadScheduler:
 
         self._store_event_to_blocks.clear()
         self._in_flight_store_gpu_blocks.clear()
+        self._lazy_step_load_blocks = 0
+        self._lazy_load_window = 0
 
         # Loads that have not been sent to the worker cannot have running DMA.
         # In-flight loads stay pinned and are cleaned up on completion.

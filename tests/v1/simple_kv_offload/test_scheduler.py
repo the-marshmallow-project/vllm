@@ -1467,6 +1467,37 @@ def test_lazy_load_evicts_cpu_copy_first() -> None:
 
 
 # ---------------------------------------------------------------------------
+# Test 2h: Lazy walk widens to cover a CPU load
+# ---------------------------------------------------------------------------
+def test_lazy_walk_covers_recent_load_allocations() -> None:
+    """Lazy: a load takes all its blocks in one step, outside the token budget.
+
+    The next walk covers target_free plus twice that, and narrows back once
+    loads stop.
+    """
+    fix = make_scheduler(num_cpu_blocks=64, num_gpu_blocks=64, lazy=True)
+    sched = fix.scheduler
+    target = sched._target_free
+    walks: list[int] = []
+    walk = sched._offload_eviction_end
+
+    def record(num_blocks: int):
+        walks.append(num_blocks)
+        return walk(num_blocks)
+
+    sched._offload_eviction_end = record
+
+    sched._lazy_step_load_blocks = 10
+    sched.build_connector_meta(make_scheduler_output({}))
+    assert walks[-1] == target + 20
+    # The window decays by 1/128 per step, rounded up.
+    for _ in range(1000):
+        sched.build_connector_meta(make_scheduler_output({}))
+    assert walks[-1] == target
+    assert sched._lazy_load_window == 0
+
+
+# ---------------------------------------------------------------------------
 # Test 3: LRU eviction order
 # ---------------------------------------------------------------------------
 def test_lru_eviction_order() -> None:
