@@ -199,6 +199,9 @@ class Gemma4PromptLookupSpeculator(Gemma4Speculator):
     """Gemma 4 MTP drafting the first slots of each draft, prompt lookup the
     rest."""
 
+    # Set from MALLOW_PROMPT_LOOKUP_MAX in __init__.
+    lookup_enabled = True
+
     def __init__(self, vllm_config, device: torch.device, req_states=None):
         super().__init__(vllm_config, device)
         self.lookup_enabled = bool(os.environ.get("MALLOW_PROMPT_LOOKUP_MAX"))
@@ -395,7 +398,7 @@ class Gemma4PromptLookupSpeculator(Gemma4Speculator):
                 if (
                     np.any(skip_draft)
                     # A Q-only drafter already drafts one token per request.
-                    and not self.q_only_draft
+                    and not getattr(self, "q_only_draft", False)
                     and can_compact_gemma4_prefill(
                         getattr(self, "model_state", None),
                         self.vllm_config.model_config,
