@@ -18,6 +18,9 @@ from vllm.config import VllmConfig, replace
 from vllm.config.compilation import CUDAGraphMode
 from vllm.distributed.parallel_state import get_pp_group
 from vllm.logger import init_logger
+from vllm.model_executor.layers.quantization.online.lm_head import (
+    quantized_lm_head_copy,
+)
 from vllm.model_executor.model_loader import get_model
 from vllm.model_executor.model_loader.utils import get_draft_load_config
 from vllm.v1.worker.gpu.attn_utils import build_slot_mappings_by_layer
@@ -318,6 +321,13 @@ class Gemma4Speculator(TargetDependentARSpeculator):
             )
         self._setup_gemma4_kv_sharing(draft_model, target_attn_layer_names)
         self._share_embeddings(draft_model, target_model)
+        quantization = self.speculative_config.draft_lm_head_quantization
+        if quantization is not None:
+            # The drafter's own head, read once per draft step. Verification
+            # still uses the target's head, so outputs are unchanged.
+            draft_model.lm_head = quantized_lm_head_copy(
+                draft_model.lm_head, quantization
+            )
         return draft_model
 
     def _create_draft_vllm_config(self) -> VllmConfig:
