@@ -18,6 +18,7 @@ instead of embedding feature-specific logic directly.
 
 import functools
 import gc
+import os
 import time
 from collections.abc import Iterable
 from contextlib import AbstractContextManager
@@ -419,6 +420,15 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                 self.model = self.load_lora_model(
                     self.model, self.vllm_config, self.device
                 )
+            target_head_quantization = os.environ.get(
+                "MALLOW_TARGET_LM_HEAD_QUANTIZATION"
+            )
+            if target_head_quantization:
+                from vllm.model_executor.layers.quantization.online.lm_head import (
+                    quantize_target_lm_head,
+                )
+
+                quantize_target_lm_head(self.model, target_head_quantization)
 
             if self.use_aux_hidden_state_outputs:
                 assert self.speculative_config is not None
