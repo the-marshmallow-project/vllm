@@ -97,7 +97,7 @@ class AutoRegressiveSpeculator(DraftModelSpeculator):
         return None
 
     def _configure_decode_metadata_update(self) -> None:
-        if self.num_speculative_steps == 1:
+        if self.num_speculative_steps == self.first_draft_step:
             self.supports_decode_metadata_update = False
             return
         super()._configure_decode_metadata_update()
@@ -115,31 +115,44 @@ class AutoRegressiveSpeculator(DraftModelSpeculator):
         """Whether each draft step writes a new KV position."""
         return True
 
+    @property
+    def q_only_draft(self) -> bool:
+        """Whether every draft step, the first included, is a one-token decode
+        from each request's last accepted token, with no draft prefill."""
+        return False
+
+    @property
+    def first_draft_step(self) -> int:
+        """The first draft step the decode loop runs; the draft prefill runs
+        step 0 unless the drafter is Q-only."""
+        return 0 if self.q_only_draft else 1
+
     def capture(self) -> None:
         logger.info("Capturing autoregressive speculator...")
         self.last_token_indices.zero_()
         self.idx_mapping.zero_()
         self.current_draft_step.zero_()
 
-        assert self.prefill_cudagraph_manager is not None
-        if self.prefill_cudagraph_manager.use_breakable_cg:
-            self.prefill_cudagraph_manager.init_breakable_cg_runner(self.model)
+        if not self.q_only_draft:
+            assert self.prefill_cudagraph_manager is not None
+            if self.prefill_cudagraph_manager.use_breakable_cg:
+                self.prefill_cudagraph_manager.init_breakable_cg_runner(self.model)
 
-        input_buffers, attn_groups = self._prefill_capture_inputs()
-        self.on_prefill_begin(self.max_num_reqs)
-        self.prefill_cudagraph_manager.capture(
-            self._prefill,
-            self.model_state,
-            input_buffers,
-            self.block_tables,
-            attn_groups,
-            self.kv_cache_config,
-            progress_bar_desc="Capturing prefill CUDA graphs",
-            slot_mappings_buffer=self._prefill_capture_slot_mappings(),
-        )
-        self.on_prefill_end(self.max_num_reqs)
+            input_buffers, attn_groups = self._prefill_capture_inputs()
+            self.on_prefill_begin(self.max_num_reqs)
+            self.prefill_cudagraph_manager.capture(
+                self._prefill,
+                self.model_state,
+                input_buffers,
+                self.block_tables,
+                attn_groups,
+                self.kv_cache_config,
+                progress_bar_desc="Capturing prefill CUDA graphs",
+                slot_mappings_buffer=self._prefill_capture_slot_mappings(),
+            )
+            self.on_prefill_end(self.max_num_reqs)
 
-        if self.num_speculative_steps == 1:
+        if self.num_speculative_steps == self.first_draft_step:
             return
 
         assert self.decode_cudagraph_manager is not None
@@ -238,8 +251,9 @@ class AutoRegressiveSpeculator(DraftModelSpeculator):
 
         attn_metadata = None
         slot_mappings_by_layer = None
-        for step in range(1, num_speculative_steps):
-            if not skip_attn and (self.advance_draft_positions or step == 1):
+        first_step = self.first_draft_step
+        for step in range(first_step, num_speculative_steps):
+            if not skip_attn and (self.advance_draft_positions or step == first_step):
                 slot_mappings = self.block_tables.compute_slot_mappings(
                     idx_mapping,
                     query_start_loc,
@@ -304,7 +318,7 @@ class AutoRegressiveSpeculator(DraftModelSpeculator):
                 num_reqs=num_reqs,
                 num_query_per_req=1,
                 seq_lens_cpu_upper_bound=seq_lens_cpu_upper_bound,
-                step=1,
+                step=self.first_draft_step,
             )
 
         self._fused_multi_step_decode(
@@ -331,9 +345,10 @@ class AutoRegressiveSpeculator(DraftModelSpeculator):
         positions = self.input_buffers.positions[:num_reqs]
         query_start_loc = self.input_buffers.query_start_loc[: num_reqs + 1]
 
-        for step in range(1, num_speculative_steps):
+        first_step = self.first_draft_step
+        for step in range(first_step, num_speculative_steps):
             if attn_metadata is not None and (
-                self.advance_draft_positions or step == 1
+                self.advance_draft_positions or step == first_step
             ):
                 self.block_tables.compute_slot_mappings(
                     idx_mapping,

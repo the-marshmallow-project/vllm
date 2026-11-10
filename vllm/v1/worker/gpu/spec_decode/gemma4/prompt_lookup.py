@@ -394,6 +394,8 @@ class Gemma4PromptLookupSpeculator(Gemma4Speculator):
                     return out
                 if (
                     np.any(skip_draft)
+                    # A Q-only drafter already drafts one token per request.
+                    and not self.q_only_draft
                     and can_compact_gemma4_prefill(
                         getattr(self, "model_state", None),
                         self.vllm_config.model_config,
