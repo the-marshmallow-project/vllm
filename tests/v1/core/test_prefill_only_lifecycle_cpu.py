@@ -104,8 +104,12 @@ def engine():
         remove_all=lambda items, removed: [r for r in items if r not in removed],
         length_from_prompt_token_ids_or_embeds=lambda tokens, embeds: len(tokens),
         StructuredOutputRequest=NS(from_sampling_params=lambda params: None),
-        gc_untrack=__import__("vllm.utils.gc_utils", fromlist=["gc_untrack"]).gc_untrack,
-        TokenBuffer=__import__("vllm.v1.token_buffer", fromlist=["TokenBuffer"]).TokenBuffer,
+        gc_untrack=__import__(
+            "vllm.utils.gc_utils", fromlist=["gc_untrack"]
+        ).gc_untrack,
+        TokenBuffer=__import__(
+            "vllm.v1.token_buffer", fromlist=["TokenBuffer"]
+        ).TokenBuffer,
     )
     load(
         ns,
@@ -424,11 +428,8 @@ def test_mixed_generation_keeps_placeholder_and_token_completion(engine):
     sched = scheduler(engine, [req, gen])
     sched.__class__.__bases__[0]._update_request_with_output.__globals__[
         "check_stop"
-    ] = (
-        lambda r, limit: setattr(
-            r, "status", engine.RequestStatus.FINISHED_LENGTH_CAPPED
-        )
-        or True
+    ] = lambda r, limit: (
+        setattr(r, "status", engine.RequestStatus.FINISHED_LENGTH_CAPPED) or True
     )
     batch = step(prepare=8, answer=8)
     sched._update_after_schedule(batch)

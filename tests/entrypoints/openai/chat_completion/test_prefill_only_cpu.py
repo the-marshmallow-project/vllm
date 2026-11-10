@@ -204,12 +204,11 @@ def api():
     serving._extract_prompt_len = lambda prompt: len(prompt["prompt_token_ids"])
     serving._get_trace_headers = AsyncMock(return_value={"traceparent": "fixture"})
     serving.models = SimpleNamespace(model_name=lambda lora: "dev-model")
+    bad_request = HTTPStatus.BAD_REQUEST
     serving.create_error_response = (
-        lambda message,
-        err_type="BadRequestError",
-        status_code=HTTPStatus.BAD_REQUEST: ns["ErrorResponse"](
-            error=ns["ErrorInfo"](message=message, type=err_type, code=int(status_code))
-        )
+        lambda message, err_type="BadRequestError", status_code=bad_request: ns[
+            "ErrorResponse"
+        ](error=ns["ErrorInfo"](message=message, type=err_type, code=int(status_code)))
     )
     prompt = {"type": "token", "prompt_token_ids": [3, 5, 8], "cache_salt": "private"}
     serving.online_renderer = SimpleNamespace(

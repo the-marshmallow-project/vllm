@@ -168,6 +168,10 @@ def prompt_lookup(
             was verified.
         num_rejected: [num_reqs] int32, its rejected draft slots.
         stats: [len(STATS)] int64 counters, added to.
+        mtp_steps: the draft slots MTP filled.
+        min_n: the shortest tail to look up.
+        max_n: the longest tail to look up.
+
     """
     num_reqs, k = draft.shape
     if num_reqs == 0:
