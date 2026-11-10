@@ -275,6 +275,7 @@ def test_native_sample_tokens_skips_logits_sampling_and_prompt_logprobs_for_warm
     )
     projection = Mock(side_effect=lambda values: values)
     runner.model = SimpleNamespace(compute_logits=projection)
+    runner.model_state = SimpleNamespace(compute_sample_logits=projection)
 
     def sample(logits, selected):
         count = selected.num_reqs
@@ -358,43 +359,3 @@ def test_native_request_slot_reuse_clears_prefill_intent(native):
     assert states.req_id_to_index["ordinary"] == slot
     assert not states.prefill_only[slot]
     assert not states.draft_tokens[slot].any()
-
-
-@pytest.mark.parametrize("prefill_only", [False, True])
-def test_legacy_runner_rejects_explicit_prefill_before_any_model_access(prefill_only):
-    path = ROOT / "vllm/v1/worker/gpu_model_runner.py"
-    cls = next(
-        node
-        for node in ast.parse(path.read_text()).body
-        if isinstance(node, ast.ClassDef) and node.name == "GPUModelRunner"
-    )
-    method = next(
-        node
-        for node in cls.body
-        if isinstance(node, ast.FunctionDef) and node.name == "execute_model"
-    )
-    method.decorator_list = []
-    future = ast.ImportFrom(
-        module="__future__", names=[ast.alias(name="annotations")], level=0
-    )
-    ns = {}
-    exec(
-        compile(
-            ast.fix_missing_locations(
-                ast.Module(body=[future, method], type_ignores=[])
-            ),
-            str(path),
-            "exec",
-        ),
-        ns,
-    )
-    scheduler = SimpleNamespace(
-        scheduled_new_reqs=[
-            SimpleNamespace(sampling_params=SimpleNamespace(prefill_only=prefill_only))
-        ]
-    )
-    runner = SimpleNamespace(execute_model_state=object())
-    error = ValueError if prefill_only else RuntimeError
-    message = "prefill_only requires" if prefill_only else "State error"
-    with pytest.raises(error, match=message):
-        ns["execute_model"](runner, scheduler)

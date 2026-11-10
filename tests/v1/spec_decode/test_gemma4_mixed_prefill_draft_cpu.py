@@ -8,6 +8,7 @@ original full-query first pass. They do not validate CUDA kernels or weights.
 """
 
 import ast
+import os
 import importlib.util
 import sys
 from dataclasses import dataclass, replace
@@ -222,7 +223,7 @@ class GraphMode(Enum):
 @pytest.mark.parametrize("dynamic,expected", [(False, [9]), (True, [9, 3])])
 def test_native_decode_capture_uses_mtp_steps_and_not_lookup_slots(dynamic, expected):
     path = Path(__file__).resolve().parents[3] / (
-        "vllm/v1/worker/gpu/spec_decode/target_dependent_ar/cudagraph_utils.py"
+        "vllm/v1/worker/gpu/spec_decode/autoregressive/cudagraph_utils.py"
     )
     tree = ast.parse(path.read_text())
     tree.body = [
@@ -296,9 +297,9 @@ def compact_runtime(packing, inputs):
             self.decode_cudagraph_manager = SimpleNamespace(kind="decode")
 
     class Graph:
-        def __init__(self, config=None, device=None, mode=None, decode_query_len=1):
+        def __init__(self, config=None, device=None, mode=None, decode_query_lens=None):
             self.mode = mode
-            self.decode_query_len = decode_query_len
+            self.decode_query_len = min(decode_query_lens) if decode_query_lens else 1
             self.use_breakable_cg = False
             self.owner = None
             self.capture_args = None
@@ -328,16 +329,21 @@ def compact_runtime(packing, inputs):
         padded = 4 if mode == GraphMode.FULL else num_reqs
         return SimpleNamespace(cg_mode=mode, num_tokens=padded, num_reqs=padded), None
 
-    def prepare_decode(drafts, original_seq, rejected, buffers, positions, *args, **kwargs):
-        # Assert the real orchestration passes original S, rather than S-R again.
-        expected = inputs.batch.seq_lens[runtime.rows]
-        torch.testing.assert_close(original_seq, expected)
-        torch.testing.assert_close(rejected, inputs.rejected[runtime.rows])
-        assert kwargs["advance_draft_positions"] is False
-        n = len(drafts)
-        buffers.input_ids[:n].copy_(drafts)
-        buffers.seq_lens[:n].copy_(original_seq - rejected)
-        positions[:n].add_(1)
+    class PrepareDecodeKernel:
+        def __getitem__(self, grid):
+            return self.launch
+
+        @staticmethod
+        def launch(drafts, stride, original_seq, rejected, input_ids, positions, sample_src, qsl, seq_lens, *args, **kw):
+            # Assert the real orchestration passes original S, rather than S-R again.
+            expected = inputs.batch.seq_lens[runtime.rows]
+            torch.testing.assert_close(original_seq, expected)
+            torch.testing.assert_close(rejected, inputs.rejected[runtime.rows])
+            assert kw["ADVANCE_DRAFT_POSITIONS"] is False
+            n = len(drafts)
+            input_ids[:n].copy_(drafts)
+            seq_lens[:n].copy_(original_seq - rejected)
+            sample_src[:n].add_(1)
 
     namespace = {
         "TargetDependentARSpeculator": Parent,
@@ -346,7 +352,8 @@ def compact_runtime(packing, inputs):
         "can_compact_gemma4_prefill": packing.can_compact_gemma4_prefill,
         "select_gemma4_prefill_inputs": packing.select_gemma4_prefill_inputs,
         "dispatch_cg_and_sync_dp": dispatch,
-        "prepare_decode_inputs": prepare_decode,
+        "_prepare_decode_inputs_kernel": PrepareDecodeKernel(),
+        "os": os,
         "build_slot_mappings_by_layer": lambda slots, config: {"draft": slots},
         "torch": torch,
         "np": np,
@@ -529,7 +536,7 @@ def compact_runtime(packing, inputs):
     runtime._run_model = run_model
     runtime.sample_draft = sample_draft
     runtime._prefill = prefill
-    runtime._fused_multi_step_decode = decode
+    runtime._run_fused_multi_step_decode = decode
     runtime._multi_step_decode = decode
     return runtime, namespace
 
