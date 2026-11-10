@@ -153,6 +153,26 @@ def quantized_lm_head_copy(
     return head
 
 
+def quantize_target_lm_head(
+    model: Module, quantization: Literal["fp8", "nvfp4"]
+) -> None:
+    """Compute `model`'s logits with a quantized copy of its lm_head.
+
+    The copy also serves a head tied to the input embeddings, which keep
+    their full-precision weight for token lookups. Unlike a drafter's copy,
+    this changes the target's logits, so it is opt-in.
+    """
+    language_model = (
+        model.get_language_model() if hasattr(model, "get_language_model") else model
+    )
+    if not hasattr(language_model, "lm_head"):
+        language_model = getattr(language_model, "language_model", language_model)
+    lm_head = getattr(language_model, "lm_head", None)
+    if lm_head is None:
+        raise ValueError(f"{type(language_model).__name__} has no lm_head to quantize.")
+    language_model.lm_head = quantized_lm_head_copy(lm_head, quantization)
+
+
 @torch.no_grad()
 def refresh_quantized_lm_heads(model: Module) -> None:
     """Re-derive the quantized lm_head copies in `model` from their source heads.
