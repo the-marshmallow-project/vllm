@@ -8,8 +8,8 @@ original full-query first pass. They do not validate CUDA kernels or weights.
 """
 
 import ast
-import os
 import importlib.util
+import os
 import sys
 from dataclasses import dataclass, replace
 from enum import Enum
@@ -27,7 +27,9 @@ endpoint_native = worker_tests.native
 
 @pytest.fixture(scope="module")
 def packing():
-    path = Path(__file__).resolve().parents[3] / ("vllm/v1/worker/gpu/spec_decode/gemma4/prefill.py")
+    path = Path(__file__).resolve().parents[3] / (
+        "vllm/v1/worker/gpu/spec_decode/gemma4/prefill.py"
+    )
     name = "_gemma4_compact_prefill_inputs_cpu"
     spec = importlib.util.spec_from_file_location(name, path)
     assert spec is not None and spec.loader is not None
@@ -46,7 +48,9 @@ def inputs():
     positions = torch.full((18,), 9999, dtype=torch.int64)
     for row, size in enumerate(sizes):
         start = int(starts[row])
-        positions[start : start + size] = torch.arange(int(seq_lens[row]) - int(size), int(seq_lens[row]))
+        positions[start : start + size] = torch.arange(
+            int(seq_lens[row]) - int(size), int(seq_lens[row])
+        )
     batch = SimpleNamespace(
         num_reqs=4,
         num_reqs_after_padding=6,
@@ -68,7 +72,9 @@ def inputs():
         sampled=torch.tensor([1, 3, 0, 0], dtype=torch.int32),
         rejected=torch.tensor([0, 2, 0, 1], dtype=torch.int32),
         last_sampled=torch.arange(8, dtype=torch.int32) * 100 + 1,
-        next_prefill=torch.stack((torch.arange(8) * 10 + 2000, torch.arange(8) * 10 + 3000)).to(torch.int32),
+        next_prefill=torch.stack(
+            (torch.arange(8) * 10 + 2000, torch.arange(8) * 10 + 3000)
+        ).to(torch.int32),
     )
 
 
@@ -87,21 +93,32 @@ def select(packing, inputs, rows):
 @pytest.mark.parametrize("rows", [(1, 3), (3, 1), (1,), (0, 2)])
 def test_compaction_preserves_request_order_and_last_valid_query(packing, inputs, rows):
     result = select(packing, inputs, rows)
-    expected_indices = [int(inputs.batch.query_start_loc_np[row + 1]) - int(inputs.rejected[row]) - 1 for row in rows]
+    expected_indices = [
+        int(inputs.batch.query_start_loc_np[row + 1]) - int(inputs.rejected[row]) - 1
+        for row in rows
+    ]
     expected_state_rows = [int(inputs.batch.idx_mapping_np[row]) for row in rows]
     expected_tokens = [
-        int(inputs.last_sampled[state]) if inputs.sampled[row] > 0 else int(inputs.next_prefill[0, state])
+        int(inputs.last_sampled[state])
+        if inputs.sampled[row] > 0
+        else int(inputs.next_prefill[0, state])
         for row, state in zip(rows, expected_state_rows)
     ]
     assert result.row_indices.tolist() == list(rows)
     assert result.idx_mapping.tolist() == expected_state_rows
     assert result.last_token_indices.tolist() == expected_indices
     assert result.input_ids.tolist() == expected_tokens
-    assert result.positions.tolist() == inputs.batch.positions[expected_indices].tolist()
+    assert (
+        result.positions.tolist() == inputs.batch.positions[expected_indices].tolist()
+    )
     torch.testing.assert_close(result.hidden_states, inputs.hidden[expected_indices])
     assert result.target_seq_lens.tolist() == inputs.batch.seq_lens[list(rows)].tolist()
-    assert result.seq_lens.tolist() == [int(inputs.batch.seq_lens[row]) - int(inputs.rejected[row]) for row in rows]
-    assert result.seq_lens_cpu_upper_bound.tolist() == (inputs.batch.seq_lens_cpu_upper_bound[list(rows)].tolist())
+    assert result.seq_lens.tolist() == [
+        int(inputs.batch.seq_lens[row]) - int(inputs.rejected[row]) for row in rows
+    ]
+    assert result.seq_lens_cpu_upper_bound.tolist() == (
+        inputs.batch.seq_lens_cpu_upper_bound[list(rows)].tolist()
+    )
     assert result.seq_lens_cpu_upper_bound.device.type == "cpu"
     assert result.num_sampled.tolist() == inputs.sampled[list(rows)].tolist()
     assert result.num_rejected.tolist() == inputs.rejected[list(rows)].tolist()
@@ -156,7 +173,9 @@ def test_preallocated_device_row_selector_is_reused(packing, inputs):
     assert result.idx_mapping.tolist() == [1, 2]
 
 
-def frozen_query_output(hidden, tokens, positions, seq_lens, state_rows, keys, values, window=None):
+def frozen_query_output(
+    hidden, tokens, positions, seq_lens, state_rows, keys, values, window=None
+):
     """Small independent frozen-KV attention oracle, not model inference."""
     h = hidden.clone()
     for layer in range(2):
@@ -174,7 +193,9 @@ def frozen_query_output(hidden, tokens, positions, seq_lens, state_rows, keys, v
 
 @pytest.mark.parametrize("rows", [(1, 3), (3, 1), (0, 2)])
 @pytest.mark.parametrize("window", [None, 2])
-def test_one_query_matches_full_valid_queries_over_frozen_target_kv(packing, inputs, rows, window):
+def test_one_query_matches_full_valid_queries_over_frozen_target_kv(
+    packing, inputs, rows, window
+):
     generator = torch.Generator().manual_seed(73)
     keys = torch.randn(2, 8, 512, 4, dtype=torch.float64, generator=generator)
     values = torch.randn(2, 8, 512, 4, dtype=torch.float64, generator=generator)
@@ -183,7 +204,11 @@ def test_one_query_matches_full_valid_queries_over_frozen_target_kv(packing, inp
         state = int(inputs.batch.idx_mapping_np[row])
         start = int(inputs.batch.query_start_loc_np[row])
         end = int(inputs.batch.query_start_loc_np[row + 1]) - int(inputs.rejected[row])
-        next_token = inputs.last_sampled[state] if inputs.sampled[row] > 0 else inputs.next_prefill[0, state]
+        next_token = (
+            inputs.last_sampled[state]
+            if inputs.sampled[row] > 0
+            else inputs.next_prefill[0, state]
+        )
         shifted = torch.cat((inputs.batch.input_ids[start + 1 : end], next_token[None]))
         positions = inputs.batch.positions[start:end]
         full = frozen_query_output(
@@ -227,7 +252,9 @@ def test_native_decode_capture_uses_mtp_steps_and_not_lookup_slots(dynamic, expe
     )
     tree = ast.parse(path.read_text())
     tree.body = [
-        ast.ImportFrom(module="__future__", names=[ast.alias(name="annotations")], level=0),
+        ast.ImportFrom(
+            module="__future__", names=[ast.alias(name="annotations")], level=0
+        ),
         *(node for node in tree.body if isinstance(node, ast.ClassDef)),
     ]
 
@@ -285,7 +312,9 @@ def compact_runtime(packing, inputs):
     root = Path(__file__).resolve().parents[3]
     path = root / "vllm/v1/worker/gpu/spec_decode/gemma4/speculator.py"
     node = next(
-        n for n in ast.parse(path.read_text()).body if isinstance(n, ast.ClassDef) and n.name == "Gemma4Speculator"
+        n
+        for n in ast.parse(path.read_text()).body
+        if isinstance(n, ast.ClassDef) and n.name == "Gemma4Speculator"
     )
 
     class Parent:
@@ -315,7 +344,9 @@ def compact_runtime(packing, inputs):
         def run_fullgraph(self, desc):
             assert self.owner.metadata_calls
             self.replays += 1
-            self.owner._prefill(desc.num_reqs, desc.num_tokens, {}, {}, None, desc.cg_mode)
+            self.owner._prefill(
+                desc.num_reqs, desc.num_tokens, {}, {}, None, desc.cg_mode
+            )
 
         def specialize_spec_tokens(self, desc, steps):
             self.specialized_steps = steps
@@ -324,7 +355,9 @@ def compact_runtime(packing, inputs):
     def dispatch(manager, num_reqs, num_tokens, **kwargs):
         assert kwargs["uniform_token_count"] == 1
         mode = (
-            GraphMode.FULL if manager is runtime.compact_prefill_cudagraph_manager and runtime.full else GraphMode.NONE
+            GraphMode.FULL
+            if manager is runtime.compact_prefill_cudagraph_manager and runtime.full
+            else GraphMode.NONE
         )
         padded = 4 if mode == GraphMode.FULL else num_reqs
         return SimpleNamespace(cg_mode=mode, num_tokens=padded, num_reqs=padded), None
@@ -334,7 +367,19 @@ def compact_runtime(packing, inputs):
             return self.launch
 
         @staticmethod
-        def launch(drafts, stride, original_seq, rejected, input_ids, positions, sample_src, qsl, seq_lens, *args, **kw):
+        def launch(
+            drafts,
+            stride,
+            original_seq,
+            rejected,
+            input_ids,
+            positions,
+            sample_src,
+            qsl,
+            seq_lens,
+            *args,
+            **kw,
+        ):
             # Assert the real orchestration passes original S, rather than S-R again.
             expected = inputs.batch.seq_lens[runtime.rows]
             torch.testing.assert_close(original_seq, expected)
@@ -361,7 +406,9 @@ def compact_runtime(packing, inputs):
     }
     tree = ast.Module(
         body=[
-            ast.ImportFrom(module="__future__", names=[ast.alias(name="annotations")], level=0),
+            ast.ImportFrom(
+                module="__future__", names=[ast.alias(name="annotations")], level=0
+            ),
             node,
         ],
         type_ignores=[],
@@ -405,7 +452,9 @@ def compact_runtime(packing, inputs):
     runtime.seeds = torch.zeros(8, dtype=torch.int64)
     runtime.draft_tokens = torch.full((8, 15), 777, dtype=torch.int64)
     runtime.compact_row_indices = torch.empty(8, dtype=torch.int64)
-    runtime.model_state = SimpleNamespace(supports_mm_inputs=False, prompt_embeds_state=None)
+    runtime.model_state = SimpleNamespace(
+        supports_mm_inputs=False, prompt_embeds_state=None
+    )
     runtime.model = object()
     runtime.attn_groups = object()
     runtime.target_attn_groups = object()
@@ -420,7 +469,9 @@ def compact_runtime(packing, inputs):
 
     class Tables:
         def __init__(self):
-            self.input_block_tables = [torch.arange(32).reshape(8, 4) + n * 100 for n in range(2)]
+            self.input_block_tables = [
+                torch.arange(32).reshape(8, 4) + n * 100 for n in range(2)
+            ]
             self.slot_mappings = torch.arange(64).reshape(2, 32)
 
         def gather_block_tables(self, mapping, num_reqs_padded):
@@ -430,12 +481,18 @@ def compact_runtime(packing, inputs):
 
         def compute_slot_mappings(self, mapping, starts, positions, padded):
             self.slot_mappings.fill_(-1)
-            self.slot_mappings[:, : len(mapping)] = positions[: len(mapping)] + mapping * 1000
+            self.slot_mappings[:, : len(mapping)] = (
+                positions[: len(mapping)] + mapping * 1000
+            )
             return self.slot_mappings[:, :padded]
 
     runtime.block_tables = Tables()
-    runtime.compact_block_table_backup = [torch.empty_like(t) for t in runtime.block_tables.input_block_tables]
-    runtime.compact_slot_mapping_backup = torch.empty_like(runtime.block_tables.slot_mappings)
+    runtime.compact_block_table_backup = [
+        torch.empty_like(t) for t in runtime.block_tables.input_block_tables
+    ]
+    runtime.compact_slot_mapping_backup = torch.empty_like(
+        runtime.block_tables.slot_mappings
+    )
     runtime._prepare_eplb_forward = lambda n: None
     runtime.on_prefill_begin = lambda n: None
     runtime.on_prefill_end = lambda n: None
@@ -445,14 +502,22 @@ def compact_runtime(packing, inputs):
     # Reuse the real per-request copy code so global RNG indices are tested too.
     path = root / "vllm/v1/worker/gpu/spec_decode/speculator.py"
     base = next(
-        n for n in ast.parse(path.read_text()).body if isinstance(n, ast.ClassDef) and n.name == "DraftModelSpeculator"
+        n
+        for n in ast.parse(path.read_text()).body
+        if isinstance(n, ast.ClassDef) and n.name == "DraftModelSpeculator"
     )
-    method = next(n for n in base.body if isinstance(n, ast.FunctionDef) and n.name == "_copy_request_inputs")
+    method = next(
+        n
+        for n in base.body
+        if isinstance(n, ast.FunctionDef) and n.name == "_copy_request_inputs"
+    )
     exec(
         compile(ast.Module(body=[method], type_ignores=[]), str(path), "exec"),
         namespace,
     )
-    runtime._copy_request_inputs = lambda *args: namespace["_copy_request_inputs"](runtime, *args)
+    runtime._copy_request_inputs = lambda *args: namespace["_copy_request_inputs"](
+        runtime, *args
+    )
 
     def metadata(**kwargs):
         runtime.metadata_calls.append(kwargs)
@@ -476,9 +541,15 @@ def compact_runtime(packing, inputs):
     def run_model(padded, *args, **kwargs):
         n = runtime.active_count
         expected = select(packing, inputs, runtime.rows)
-        torch.testing.assert_close(runtime.input_buffers.input_ids[:n], expected.input_ids)
-        torch.testing.assert_close(runtime.input_buffers.positions[:n], expected.positions)
-        torch.testing.assert_close(runtime.input_buffers.seq_lens[:n], expected.seq_lens)
+        torch.testing.assert_close(
+            runtime.input_buffers.input_ids[:n], expected.input_ids
+        )
+        torch.testing.assert_close(
+            runtime.input_buffers.positions[:n], expected.positions
+        )
+        torch.testing.assert_close(
+            runtime.input_buffers.seq_lens[:n], expected.seq_lens
+        )
         torch.testing.assert_close(runtime.hidden_states[:n], expected.hidden_states)
         assert not runtime.hidden_states[n:padded].any()
         assert not runtime.input_buffers.input_ids[n:padded].any()
@@ -502,7 +573,9 @@ def compact_runtime(packing, inputs):
         for n in ast.parse(path.read_text()).body
         if isinstance(n, ast.ClassDef) and n.name == "TargetDependentARSpeculator"
     )
-    method = next(n for n in base.body if isinstance(n, ast.FunctionDef) and n.name == "_prefill")
+    method = next(
+        n for n in base.body if isinstance(n, ast.FunctionDef) and n.name == "_prefill"
+    )
     exec(
         compile(ast.Module(body=[method], type_ignores=[]), str(path), "exec"),
         namespace,
@@ -524,8 +597,12 @@ def compact_runtime(packing, inputs):
     def decode(n, skip, desc, sync, bounds, steps):
         runtime.decode_calls.append(n)
         expected = select(packing, inputs, runtime.rows)
-        torch.testing.assert_close(runtime.input_buffers.seq_lens[:n], expected.seq_lens)
-        torch.testing.assert_close(runtime.sample_src_positions[:n], expected.positions + 2)
+        torch.testing.assert_close(
+            runtime.input_buffers.seq_lens[:n], expected.seq_lens
+        )
+        torch.testing.assert_close(
+            runtime.sample_src_positions[:n], expected.positions + 2
+        )
         if runtime.fail_at == "decode":
             raise RuntimeError("decode failure")
         assert runtime.decode_cudagraph_manager.specialized_steps == steps
@@ -558,7 +635,9 @@ def run_compact(runtime, inputs, steps=9):
 
 @pytest.mark.parametrize("full", [False, True])
 @pytest.mark.parametrize("steps", [1, 9])
-def test_actual_mixed_path_runs_only_selected_queries_and_preserves_buffers(compact_runtime, inputs, full, steps):
+def test_actual_mixed_path_runs_only_selected_queries_and_preserves_buffers(
+    compact_runtime, inputs, full, steps
+):
     runtime, _ = compact_runtime
     runtime.full = full
     runtime.num_speculative_steps = steps
@@ -585,7 +664,9 @@ def test_actual_mixed_path_runs_only_selected_queries_and_preserves_buffers(comp
         ]
         for actual, saved in zip(runtime.block_tables.input_block_tables, tables):
             torch.testing.assert_close(actual, saved, rtol=0, atol=0)
-        torch.testing.assert_close(runtime.block_tables.slot_mappings, slots, rtol=0, atol=0)
+        torch.testing.assert_close(
+            runtime.block_tables.slot_mappings, slots, rtol=0, atol=0
+        )
     assert runtime.prefill_calls == [(4, 4) if full else (2, 2)] * 2
     assert runtime.decode_calls == ([2, 2] if steps > 1 else [])
     assert runtime.compact_prefill_cudagraph_manager.replays == (2 if full else 0)
@@ -599,9 +680,9 @@ def test_compact_attention_preserves_target_sliding_window_null_blocks(
     runtime.full = full
     full_table, sliding_table = runtime.block_tables.input_block_tables
     for table in (full_table, sliding_table):
-        table[:inputs.batch.num_reqs] = (
-            inputs.batch.idx_mapping[:, None] * 100 + torch.arange(table.shape[1])
-        )
+        table[: inputs.batch.num_reqs] = inputs.batch.idx_mapping[
+            :, None
+        ] * 100 + torch.arange(table.shape[1])
     # Native target gather masks these expired pages to the null block.
     sliding_table[1, :1] = 0
     sliding_table[3, :2] = 0
@@ -627,7 +708,9 @@ def test_compact_attention_preserves_target_sliding_window_null_blocks(
 
 
 @pytest.mark.parametrize("failure", ["prefill", "decode"])
-def test_compact_failure_restores_shared_target_tables_and_manager(compact_runtime, inputs, failure):
+def test_compact_failure_restores_shared_target_tables_and_manager(
+    compact_runtime, inputs, failure
+):
     runtime, _ = compact_runtime
     runtime.fail_at = failure
     manager = runtime.prefill_cudagraph_manager
@@ -638,16 +721,22 @@ def test_compact_failure_restores_shared_target_tables_and_manager(compact_runti
     assert runtime.prefill_cudagraph_manager is manager
     for actual, saved in zip(runtime.block_tables.input_block_tables, tables):
         torch.testing.assert_close(actual, saved, rtol=0, atol=0)
-    torch.testing.assert_close(runtime.block_tables.slot_mappings, slots, rtol=0, atol=0)
+    torch.testing.assert_close(
+        runtime.block_tables.slot_mappings, slots, rtol=0, atol=0
+    )
 
 
 @pytest.mark.parametrize("fail", [False, True])
-def test_compact_capture_uses_own_buffers_and_restores_original_manager(compact_runtime, fail):
+def test_compact_capture_uses_own_buffers_and_restores_original_manager(
+    compact_runtime, fail
+):
     runtime, _ = compact_runtime
     original = runtime.prefill_cudagraph_manager
     manager = runtime.compact_prefill_cudagraph_manager
     manager.capture_error = fail
-    runtime._prefill = lambda n, padded, *args: runtime.prefill_calls.append((n, padded))
+    runtime._prefill = lambda n, padded, *args: runtime.prefill_calls.append(
+        (n, padded)
+    )
     if fail:
         with pytest.raises(RuntimeError, match="capture failure"):
             runtime.capture()
@@ -673,7 +762,9 @@ def test_compact_capture_uses_own_buffers_and_restores_original_manager(compact_
         (False, GraphMode.FULL, None),
     ],
 )
-def test_compact_graph_manager_is_separate_and_opt_in(compact_runtime, enabled, mode, expected):
+def test_compact_graph_manager_is_separate_and_opt_in(
+    compact_runtime, enabled, mode, expected
+):
     runtime, _ = compact_runtime
     runtime.skip_prefill_draft = enabled
     runtime.init_cudagraph_manager(mode)
@@ -721,7 +812,9 @@ def test_only_known_text_state_can_compact(packing, state, config, expected):
     assert packing.can_compact_gemma4_prefill(state, config) is expected
 
 
-def test_padded_full_replay_postprocessing_keeps_live_results_valid(compact_runtime, inputs):
+def test_padded_full_replay_postprocessing_keeps_live_results_valid(
+    compact_runtime, inputs
+):
     runtime, _ = compact_runtime
     runtime.full = True
     result = run_compact(runtime, inputs)
@@ -748,7 +841,9 @@ def test_public_mixed_proposal_excludes_prefill_from_model_and_lookup_then_scatt
 ):
     runtime, namespace = compact_runtime
     runtime.full = full
-    path = Path(__file__).resolve().parents[3] / ("vllm/v1/worker/gpu/spec_decode/gemma4/prompt_lookup.py")
+    path = Path(__file__).resolve().parents[3] / (
+        "vllm/v1/worker/gpu/spec_decode/gemma4/prompt_lookup.py"
+    )
     node = next(
         n
         for n in ast.parse(path.read_text()).body
@@ -756,7 +851,9 @@ def test_public_mixed_proposal_excludes_prefill_from_model_and_lookup_then_scatt
     )
     lookup_calls = []
 
-    def lookup(tokens, lengths, mapping, drafts, out, extended, sampled, rejected, *args):
+    def lookup(
+        tokens, lengths, mapping, drafts, out, extended, sampled, rejected, *args
+    ):
         lookup_calls.append(mapping.tolist())
         assert mapping.tolist() == [2, 1]
         assert len(drafts) == len(out) == 2
@@ -775,7 +872,9 @@ def test_public_mixed_proposal_excludes_prefill_from_model_and_lookup_then_scatt
     )
     tree = ast.Module(
         body=[
-            ast.ImportFrom(module="__future__", names=[ast.alias(name="annotations")], level=0),
+            ast.ImportFrom(
+                module="__future__", names=[ast.alias(name="annotations")], level=0
+            ),
             node,
         ],
         type_ignores=[],
@@ -791,7 +890,9 @@ def test_public_mixed_proposal_excludes_prefill_from_model_and_lookup_then_scatt
     proposal.compact_prefill_cudagraph_manager.owner = proposal
     proposal.prompt_len_np = np.arange(8, dtype=np.int32) * 100
     proposal.max_seq_len_np = proposal.prompt_len_np + 128
-    proposal.max_seq_len_np[[5, 7]] = proposal.prompt_len_np[[5, 7]] + int(not explicit_prefill)
+    proposal.max_seq_len_np[[5, 7]] = proposal.prompt_len_np[[5, 7]] + int(
+        not explicit_prefill
+    )
     proposal.prefill_only_np = np.zeros(8, dtype=bool)
     proposal.prefill_only_np[[5, 7]] = explicit_prefill
     proposal.draft_watermarker = None
@@ -827,8 +928,12 @@ def test_public_mixed_proposal_excludes_prefill_from_model_and_lookup_then_scatt
         return
     steps = min(9, budget)
     assert not result[[0, 2]].any()
-    assert result[1, :budget].tolist() == [200 + min(step, steps - 1) for step in range(budget)]
-    assert result[3, :budget].tolist() == [100 + min(step, steps - 1) for step in range(budget)]
+    assert result[1, :budget].tolist() == [
+        200 + min(step, steps - 1) for step in range(budget)
+    ]
+    assert result[3, :budget].tolist() == [
+        100 + min(step, steps - 1) for step in range(budget)
+    ]
     assert lookup_calls == [[2, 1]]
     assert proposal.lookup_extended[[5, 7]].tolist() == [0, 0]
     assert proposal.steps == 1
@@ -837,13 +942,17 @@ def test_public_mixed_proposal_excludes_prefill_from_model_and_lookup_then_scatt
 
 @pytest.fixture(scope="module")
 def completion_native(endpoint_native):
-    worker_tests.load_nodes("vllm/v1/outputs.py", {"LogprobsLists", "SamplingMaskLists"}, endpoint_native)
+    worker_tests.load_nodes(
+        "vllm/v1/outputs.py", {"LogprobsLists", "SamplingMaskLists"}, endpoint_native
+    )
     return endpoint_native
 
 
 @pytest.mark.parametrize("seed", range(16))
 @pytest.mark.parametrize("mask_slots", [1, 16])
-def test_mixed_sampler_matches_full_reference_for_ordinary_replies(completion_native, seed, mask_slots):
+def test_mixed_sampler_matches_full_reference_for_ordinary_replies(
+    completion_native, seed, mask_slots
+):
     ns = completion_native
     rng = np.random.default_rng(600 + seed)
     count = int(rng.integers(2, 12))
@@ -866,7 +975,10 @@ def test_mixed_sampler_matches_full_reference_for_ordinary_replies(completion_na
     prefill_lengths = seq_lens + unfinished * 8
     positions = torch.from_numpy(
         np.concatenate(
-            [np.arange(int(seq_lens[i]) - q, int(seq_lens[i])) for i, q in enumerate(queries)]
+            [
+                np.arange(int(seq_lens[i]) - q, int(seq_lens[i]))
+                for i, q in enumerate(queries)
+            ]
             + [np.full(padded - tokens, -1)]
         )
     )
@@ -877,7 +989,9 @@ def test_mixed_sampler_matches_full_reference_for_ordinary_replies(completion_na
         idx_mapping=torch.from_numpy(slots),
         idx_mapping_np=slots,
         expanded_idx_mapping=torch.from_numpy(np.repeat(slots, logit_counts)),
-        expanded_local_pos=torch.from_numpy(np.concatenate([np.arange(n) for n in logit_counts])),
+        expanded_local_pos=torch.from_numpy(
+            np.concatenate([np.arange(n) for n in logit_counts])
+        ),
         num_scheduled_tokens=queries,
         num_tokens=tokens,
         num_tokens_after_padding=padded,
@@ -898,7 +1012,12 @@ def test_mixed_sampler_matches_full_reference_for_ordinary_replies(completion_na
         positions=positions,
         is_padding=positions < 0,
         logits_indices=torch.from_numpy(
-            np.concatenate([np.arange(query[i + 1] - n, query[i + 1]) for i, n in enumerate(logit_counts)])
+            np.concatenate(
+                [
+                    np.arange(query[i + 1] - n, query[i + 1])
+                    for i, n in enumerate(logit_counts)
+                ]
+            )
         ),
         cu_num_logits=torch.from_numpy(cu),
         cu_num_logits_np=cu,
@@ -914,11 +1033,15 @@ def test_mixed_sampler_matches_full_reference_for_ordinary_replies(completion_na
         position = batch.positions[batch.logits_indices]
         token = batch.input_ids[batch.logits_indices]
         score = projected + position * 7 + token * 3
-        choices = (score + row_seed[batch.expanded_idx_mapping] + batch.expanded_local_pos) % 127
+        choices = (
+            score + row_seed[batch.expanded_idx_mapping] + batch.expanded_local_pos
+        ) % 127
         output = torch.zeros((batch.num_reqs, mask_slots), dtype=torch.int64)
         counts = torch.zeros(batch.num_reqs, dtype=torch.int32)
         rejected = torch.zeros_like(counts)
-        for i, (lo, hi) in enumerate(zip(batch.cu_num_logits_np[:-1], batch.cu_num_logits_np[1:])):
+        for i, (lo, hi) in enumerate(
+            zip(batch.cu_num_logits_np[:-1], batch.cu_num_logits_np[1:])
+        ):
             if batch.seq_lens[i] >= batch.prefill_len_np[i]:
                 counts[i] = int(choices[lo]) % (hi - lo) + 1
                 rejected[i] = hi - lo - counts[i]
@@ -936,20 +1059,28 @@ def test_mixed_sampler_matches_full_reference_for_ordinary_replies(completion_na
         wider = torch.nonzero(supports == 2).flatten()
         for value in (flat[wider], (flat[wider] + 1) % 127):
             packed[wider, value // 8] |= (1 << (value % 8)).to(torch.uint8)
-        masks = ns["SamplingMaskTensors"](flat[:, None].int(), packed, supports, 127, mask_slots)
+        masks = ns["SamplingMaskTensors"](
+            flat[:, None].int(), packed, supports, 127, mask_slots
+        )
         return ns["SamplerOutput"](output, logprobs, None, counts, rejected, masks)
 
     baseline = sample_reference(original, hidden)
     compact, compact_hidden, rows = ns["completion_inputs"](original, hidden, warm)
     compact_output = sample_reference(compact, compact_hidden)
-    result = ns["scatter_completion_output"](compact_output, rows, count, hidden.device, compact.cu_num_logits_np)
+    result = ns["scatter_completion_output"](
+        compact_output, rows, count, hidden.device, compact.cu_num_logits_np
+    )
     np.testing.assert_array_equal(rows, np.flatnonzero(~warm[slots]))
     assert not result.num_sampled[warm[slots]].any()
     assert not result.num_rejected[warm[slots]].any()
     assert not result.sampled_token_ids[warm[slots]].any()
     assert result.sampling_mask_tensors.rows_per_request == mask_slots
-    assert not result.sampling_mask_tensors.counts.reshape(count, mask_slots)[warm[slots]].any()
-    expected_masks = baseline.sampling_mask_tensors.tolists(baseline.num_sampled.numpy())
+    assert not result.sampling_mask_tensors.counts.reshape(count, mask_slots)[
+        warm[slots]
+    ].any()
+    expected_masks = baseline.sampling_mask_tensors.tolists(
+        baseline.num_sampled.numpy()
+    )
     actual_masks = result.sampling_mask_tensors.tolists(result.num_sampled.numpy())
     expected_logprobs = baseline.logprobs_tensors.tolists()
     actual_logprobs = result.logprobs_tensors.tolists()
@@ -957,11 +1088,15 @@ def test_mixed_sampler_matches_full_reference_for_ordinary_replies(completion_na
         sampled = int(baseline.num_sampled[row])
         assert result.num_sampled[row] == sampled
         assert result.num_rejected[row] == baseline.num_rejected[row]
-        torch.testing.assert_close(result.sampled_token_ids[row], baseline.sampled_token_ids[row])
+        torch.testing.assert_close(
+            result.sampled_token_ids[row], baseline.sampled_token_ids[row]
+        )
         actual_lp = actual_logprobs.slice_request(row, sampled)
         expected_lp = expected_logprobs.slice_request(row, sampled)
         np.testing.assert_array_equal(actual_lp.logprobs, expected_lp.logprobs)
-        np.testing.assert_array_equal(actual_lp.logprob_token_ids, expected_lp.logprob_token_ids)
+        np.testing.assert_array_equal(
+            actual_lp.logprob_token_ids, expected_lp.logprob_token_ids
+        )
         assert actual_masks.slice_request(row, sampled).to_nested_list() == (
             expected_masks.slice_request(row, sampled).to_nested_list()
         )

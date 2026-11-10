@@ -26,12 +26,12 @@ from vllm.model_executor.model_loader import get_model
 from vllm.model_executor.model_loader.utils import get_draft_load_config
 from vllm.v1.worker.gpu.attn_utils import build_slot_mappings_by_layer
 from vllm.v1.worker.gpu.dp_utils import dispatch_cg_and_sync_dp
+from vllm.v1.worker.gpu.spec_decode.autoregressive.cudagraph_utils import (
+    SpeculatorCudaGraphManager,
+)
 from vllm.v1.worker.gpu.spec_decode.gemma4.prefill import (
     can_compact_gemma4_prefill,
     select_gemma4_prefill_inputs,
-)
-from vllm.v1.worker.gpu.spec_decode.autoregressive.cudagraph_utils import (
-    SpeculatorCudaGraphManager,
 )
 from vllm.v1.worker.gpu.spec_decode.target_dependent_ar.speculator import (
     TargetDependentARSpeculator,
@@ -81,15 +81,23 @@ class Gemma4Speculator(TargetDependentARSpeculator):
         if getattr(self, "skip_prefill_draft", False) and can_compact_gemma4_prefill(
             self.model_state, self.vllm_config.model_config
         ):
-            self.compact_row_indices = torch.empty(self.max_num_reqs, dtype=torch.int64, device=self.device)
+            self.compact_row_indices = torch.empty(
+                self.max_num_reqs, dtype=torch.int64, device=self.device
+            )
             self.prefill_req_indices = torch.empty_like(self.compact_row_indices)
-            self.compact_block_table_backup = [torch.empty_like(table) for table in block_tables.input_block_tables]
-            self.compact_slot_mapping_backup = torch.empty_like(block_tables.slot_mappings)
+            self.compact_block_table_backup = [
+                torch.empty_like(table) for table in block_tables.input_block_tables
+            ]
+            self.compact_slot_mapping_backup = torch.empty_like(
+                block_tables.slot_mappings
+            )
 
     def init_cudagraph_manager(self, cudagraph_mode: CUDAGraphMode) -> None:
         super().init_cudagraph_manager(cudagraph_mode)
         compact_mode = (
-            CUDAGraphMode.FULL_DECODE_ONLY if cudagraph_mode.decode_mode() == CUDAGraphMode.FULL else CUDAGraphMode.NONE
+            CUDAGraphMode.FULL_DECODE_ONLY
+            if cudagraph_mode.decode_mode() == CUDAGraphMode.FULL
+            else CUDAGraphMode.NONE
         )
         self.compact_prefill_cudagraph_manager = (
             SpeculatorCudaGraphManager(
@@ -99,7 +107,9 @@ class Gemma4Speculator(TargetDependentARSpeculator):
                 decode_query_lens={1: self.max_num_reqs},
             )
             if getattr(self, "skip_prefill_draft", False)
-            and can_compact_gemma4_prefill(getattr(self, "model_state", None), self.vllm_config.model_config)
+            and can_compact_gemma4_prefill(
+                getattr(self, "model_state", None), self.vllm_config.model_config
+            )
             else None
         )
 
@@ -108,7 +118,9 @@ class Gemma4Speculator(TargetDependentARSpeculator):
         manager = getattr(self, "compact_prefill_cudagraph_manager", None)
         if manager is None:
             return
-        self.last_token_indices.copy_(torch.arange(self.max_num_reqs, device=self.device))
+        self.last_token_indices.copy_(
+            torch.arange(self.max_num_reqs, device=self.device)
+        )
         self.idx_mapping.zero_()
         self.current_draft_step.zero_()
         original_manager = self.prefill_cudagraph_manager
@@ -154,7 +166,9 @@ class Gemma4Speculator(TargetDependentARSpeculator):
     ) -> torch.Tensor:
         """Draft only selected requests; Gemma's Q-only queries share frozen KV."""
         num_reqs = len(active_rows)
-        self.compact_row_indices[:num_reqs].copy_(torch.from_numpy(active_rows), non_blocking=True)
+        self.compact_row_indices[:num_reqs].copy_(
+            torch.from_numpy(active_rows), non_blocking=True
+        )
         packed = select_gemma4_prefill_inputs(
             input_batch,
             active_rows,
@@ -171,11 +185,15 @@ class Gemma4Speculator(TargetDependentARSpeculator):
         self.input_buffers.positions[num_reqs : self.max_num_reqs].zero_()
         self.input_buffers.seq_lens[:num_reqs].copy_(packed.seq_lens)
         self.input_buffers.seq_lens[num_reqs:].zero_()
-        self.input_buffers.query_start_loc[: num_reqs + 1].copy_(torch.arange(num_reqs + 1, device=self.device))
+        self.input_buffers.query_start_loc[: num_reqs + 1].copy_(
+            torch.arange(num_reqs + 1, device=self.device)
+        )
         self.input_buffers.query_start_loc[num_reqs + 1 :].fill_(num_reqs)
         self.hidden_states[:num_reqs].copy_(packed.hidden_states)
         self.hidden_states[num_reqs : self.max_num_reqs].zero_()
-        self.last_token_indices[:num_reqs].copy_(torch.arange(num_reqs, device=self.device))
+        self.last_token_indices[:num_reqs].copy_(
+            torch.arange(num_reqs, device=self.device)
+        )
         self.last_token_indices[num_reqs:].zero_()
         self.current_draft_step.zero_()
         self.draft_max_seq_len = min(
@@ -198,9 +216,7 @@ class Gemma4Speculator(TargetDependentARSpeculator):
                 self.block_tables.input_block_tables,
                 strict=True,
             ):
-                torch.index_select(
-                    backup, 0, packed.row_indices, out=table[:num_reqs]
-                )
+                torch.index_select(backup, 0, packed.row_indices, out=table[:num_reqs])
                 table[num_reqs:].zero_()
             batch_desc, _ = dispatch_cg_and_sync_dp(
                 self.prefill_cudagraph_manager,
@@ -239,7 +255,9 @@ class Gemma4Speculator(TargetDependentARSpeculator):
                         num_reqs,
                         batch_desc.num_tokens,
                         metadata,
-                        build_slot_mappings_by_layer(slot_mappings, self.kv_cache_config),
+                        build_slot_mappings_by_layer(
+                            slot_mappings, self.kv_cache_config
+                        ),
                         num_tokens_across_dp=None,
                         cudagraph_runtime_mode=batch_desc.cg_mode,
                     )
@@ -273,7 +291,9 @@ class Gemma4Speculator(TargetDependentARSpeculator):
                     dp_rank=self.dp_rank,
                 )
                 if self.decode_cudagraph_manager is not None:
-                    batch_desc = self.decode_cudagraph_manager.specialize_spec_tokens(batch_desc, num_speculative_steps)
+                    batch_desc = self.decode_cudagraph_manager.specialize_spec_tokens(
+                        batch_desc, num_speculative_steps
+                    )
                 self.on_multi_step_decode_begin(num_reqs)
                 decode_fn = (
                     self._run_fused_multi_step_decode
@@ -387,7 +407,9 @@ class Gemma4Speculator(TargetDependentARSpeculator):
             return
 
         target_num_kv_shared = getattr(target_text_config, "num_kv_shared_layers", 0)
-        target_num_layers = getattr(target_text_config, "num_hidden_layers", len(target_layer_types))
+        target_num_layers = getattr(
+            target_text_config, "num_hidden_layers", len(target_layer_types)
+        )
         num_non_shared = target_num_layers - target_num_kv_shared
         type_to_target_indices: dict[str, list[int]] = defaultdict(list)
         for idx, lt in enumerate(target_layer_types[:num_non_shared]):
@@ -407,7 +429,11 @@ class Gemma4Speculator(TargetDependentARSpeculator):
             if attn is None:
                 continue
 
-            draft_layer_type = draft_layer_types[draft_idx] if draft_idx < len(draft_layer_types) else "full_attention"
+            draft_layer_type = (
+                draft_layer_types[draft_idx]
+                if draft_idx < len(draft_layer_types)
+                else "full_attention"
+            )
             candidates = type_to_target_indices.get(draft_layer_type, [])
             if not candidates:
                 logger.warning(
@@ -426,7 +452,9 @@ class Gemma4Speculator(TargetDependentARSpeculator):
             # The BF16 draft model has no quantization config, so its K/V scales
             # otherwise remain at the default 1.0 while it reads the target's
             # calibrated FP8 cache.
-            target_attn = self.vllm_config.compilation_config.static_forward_context[target_layer_name]
+            target_attn = self.vllm_config.compilation_config.static_forward_context[
+                target_layer_name
+            ]
             _copy_target_kv_scales(attn, target_attn)
 
             logger.info(
@@ -442,7 +470,9 @@ class Gemma4Speculator(TargetDependentARSpeculator):
         target_model: nn.Module,
     ) -> None:
         target_language_model = (
-            target_model.get_language_model() if hasattr(target_model, "get_language_model") else target_model
+            target_model.get_language_model()
+            if hasattr(target_model, "get_language_model")
+            else target_model
         )
         if get_pp_group().world_size == 1:
             target_embed = getattr(target_language_model.model, "embed_tokens", None)

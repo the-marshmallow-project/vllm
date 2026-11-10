@@ -1125,7 +1125,9 @@ class Scheduler(SchedulerInterface):
             if self.reply_first:
                 warmup_slots = sum(
                     request.prefill_only
-                    for request in itertools.chain(self.running, self.kv_holding_waiting)
+                    for request in itertools.chain(
+                        self.running, self.kv_holding_waiting
+                    )
                 )
 
             def skip_request(

@@ -819,7 +819,9 @@ def _prepare_q_only_decode_inputs_kernel(
         for i in range(0, max_num_reqs + 1, BLOCK_SIZE):
             block = i + tl.arange(0, BLOCK_SIZE)
             q = tl.where(block < num_reqs, block, num_reqs)
-            tl.store(draft_query_start_loc_ptr + block, q, mask=block < max_num_reqs + 1)
+            tl.store(
+                draft_query_start_loc_ptr + block, q, mask=block < max_num_reqs + 1
+            )
         for i in range(num_reqs, max_num_reqs, BLOCK_SIZE):
             block = i + tl.arange(0, BLOCK_SIZE)
             tl.store(draft_seq_lens_ptr + block, 0, mask=block < max_num_reqs)
@@ -853,4 +855,6 @@ def _prepare_q_only_decode_inputs_kernel(
     for i in range(0, hidden_size, BLOCK_SIZE):
         block = i + tl.arange(0, BLOCK_SIZE)
         mask = block < hidden_size
-        tl.store(dst_row_ptr + block, tl.load(src_row_ptr + block, mask=mask), mask=mask)
+        tl.store(
+            dst_row_ptr + block, tl.load(src_row_ptr + block, mask=mask), mask=mask
+        )
