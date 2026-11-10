@@ -104,6 +104,8 @@ def engine():
         remove_all=lambda items, removed: [r for r in items if r not in removed],
         length_from_prompt_token_ids_or_embeds=lambda tokens, embeds: len(tokens),
         StructuredOutputRequest=NS(from_sampling_params=lambda params: None),
+        gc_untrack=__import__("vllm.utils.gc_utils", fromlist=["gc_untrack"]).gc_untrack,
+        TokenBuffer=__import__("vllm.v1.token_buffer", fromlist=["TokenBuffer"]).TokenBuffer,
     )
     load(
         ns,
@@ -177,6 +179,7 @@ def engine():
             "get_request_counts",
             "update_draft_token_ids",
             "_preempt_request",
+            "_unreserve_parked",
             "schedule",
         },
     )
@@ -260,7 +263,11 @@ def scheduler(engine, requests):
         running=list(requests),
         waiting=Queue(),
         kv_holding_waiting=Queue(),
+        async_kv_waiting=Queue(),
         deferred_waiting=set(),
+        vllm_config=NS(watermark_config=None),
+        _parked_reservations={},
+        _parked_reserved_blocks=0,
         _inflight_prefills=set(requests),
         _pending_encoder_input_ids={},
         _kv_fetch_stages=None,
@@ -491,9 +498,16 @@ def test_prefill_cpu_scheduler_uses_full_context_without_draft_headroom(engine):
         scheduler_config=NS(
             max_num_batched_tokens=8,
             long_prefill_token_threshold=0,
+            enable_chunked_prefill=True,
         ),
-        vllm_config=NS(speculative_config=NS(max_num_new_slots_for_drafting=3)),
+        vllm_config=NS(
+            speculative_config=NS(max_num_new_slots_for_drafting=3),
+            watermark_config=None,
+        ),
         _pause_state=engine.PauseState.PAUSED_NEW,
+        max_num_active_reqs=4,
+        num_waiting_for_streaming_input=0,
+        cache_aware_window=0,
         max_num_encoder_input_tokens=0,
         need_mamba_block_aligned_split=False,
         num_lookahead_tokens=3,
