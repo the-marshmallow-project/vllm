@@ -134,8 +134,7 @@ class InputProcessor:
         parallel = config.parallel_config
         model = self.model_config
         if (
-            not config.use_v2_model_runner
-            or not self.cache_config.enable_prefix_caching
+            not self.cache_config.enable_prefix_caching
             or any(
                 getattr(parallel, name) != 1
                 for name in (

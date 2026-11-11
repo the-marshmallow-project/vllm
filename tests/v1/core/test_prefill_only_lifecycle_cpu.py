@@ -587,7 +587,6 @@ def admission(engine):
     proc.cache_config = NS(enable_prefix_caching=True, kv_sharing_fast_prefill=False)
     proc.speculative_config = None
     proc.vllm_config = NS(
-        use_v2_model_runner=True,
         watermark_config=None,
         parallel_config=NS(
             tensor_parallel_size=1,
@@ -603,7 +602,6 @@ def admission(engine):
 @pytest.mark.parametrize(
     "owner,name,value",
     [
-        ("vllm_config", "use_v2_model_runner", False),
         ("model_config", "is_encoder_decoder", True),
         ("model_config", "enable_prompt_embeds", True),
         ("model_config", "is_diffusion", True),
