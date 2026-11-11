@@ -431,7 +431,10 @@ class Gemma4PromptLookupSpeculator(Gemma4Speculator):
                         0, self.prefill_req_indices[: len(prefill_indices)], 0
                     )
         if draft is None:
-            if explicit_prefill:
+            # A Q-only drafter decodes one token per request from its last
+            # accepted token, so warm-up rows need no draft prefill; the
+            # scheduler drops their drafts.
+            if explicit_prefill and not getattr(self, "q_only_draft", False):
                 raise RuntimeError("prefill_only requests cannot enter draft proposal")
             draft = super().propose(
                 input_batch,
