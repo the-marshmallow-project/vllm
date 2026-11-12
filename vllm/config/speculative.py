@@ -1951,11 +1951,20 @@ class SpeculativeConfig:
             )
 
         if self.draft_lm_head_quantization is not None:
-            # Gemma-4 MTP scores tied embedding rows directly; no lm_head to share.
-            if self.method not in ("eagle", "eagle3", "mtp") or self.use_gemma4_mtp():
+            if self.method not in ("eagle", "eagle3", "mtp"):
                 raise ValueError(
                     "draft_lm_head_quantization is not supported for method "
                     f"{self.method!r}."
+                )
+            # On Gemma 4 MTP it quantizes the drafter's own head. Drafters with
+            # ordered embeddings score centroid-selected rows of its weight
+            # directly instead of running the head.
+            if self.use_gemma4_mtp() and getattr(
+                self.draft_model_config.hf_config, "use_ordered_embeddings", False
+            ):
+                raise ValueError(
+                    "draft_lm_head_quantization is not supported for Gemma 4 MTP "
+                    "drafters with ordered embeddings."
                 )
             draft = self.draft_model_config
             if draft is not None and draft.head_dtype != draft.dtype:
