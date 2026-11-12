@@ -9,6 +9,7 @@ original full-query first pass. They do not validate CUDA kernels or weights.
 
 import ast
 import importlib.util
+import os
 import sys
 from dataclasses import dataclass, replace
 from enum import Enum
@@ -347,6 +348,7 @@ def compact_runtime(packing, inputs):
         "select_gemma4_prefill_inputs": packing.select_gemma4_prefill_inputs,
         "dispatch_cg_and_sync_dp": dispatch,
         "prepare_decode_inputs": prepare_decode,
+        "os": os,
         "build_slot_mappings_by_layer": lambda slots, config: {"draft": slots},
         "torch": torch,
         "np": np,

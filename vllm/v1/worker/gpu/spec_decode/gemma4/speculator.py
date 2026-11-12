@@ -7,6 +7,7 @@ The Gemma4 assistant model runs all decoder layers per draft step
 with the target model via cross-model KV sharing.
 """
 
+import os
 from collections import defaultdict
 
 import numpy as np
@@ -288,6 +289,17 @@ class Gemma4Speculator(TargetDependentARSpeculator):
             ):
                 table.copy_(backup)
             self.block_tables.slot_mappings.copy_(self.compact_slot_mapping_backup)
+
+    @property
+    def q_only_draft(self) -> bool:
+        # The drafter writes no KV and reads the target's, so its draft
+        # prefill only matters at each request's last accepted token: with
+        # MALLOW_GEMMA4_Q_ONLY_DRAFT=1, draft step 0 decodes from there instead.
+        return (
+            os.environ.get("MALLOW_GEMMA4_Q_ONLY_DRAFT") == "1"
+            and self.pcp_manager is None
+            and not self.enable_adaptive_verification
+        )
 
     @property
     def advance_draft_positions(self) -> bool:
