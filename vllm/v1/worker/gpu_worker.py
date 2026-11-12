@@ -6,7 +6,7 @@ import copy
 import gc
 import os
 import time
-from collections.abc import Callable, Iterable
+from collections.abc import Callable, Iterable, Iterator
 from contextlib import AbstractContextManager, ExitStack, contextmanager, nullcontext
 from datetime import timedelta
 from fnmatch import filter as fnmatch_filter
@@ -132,6 +132,26 @@ from .gpu.warmup import run_kv_cache_sizing_warmup, warmup_kernels
 from .utils import request_memory
 
 logger = init_logger(__name__)
+
+
+@contextmanager
+def _peak_left_out_of_reserve(device: torch.device, kv_cache) -> Iterator[None]:
+    """Keep the block's own memory peak out of the extensible KV cache reserve.
+
+    The peak recorded before the block still counts. FlashInfer autotuning
+    profiles every tactic at the largest token bucket and frees its buffers
+    when done, so its peak never recurs while serving; the workspace a chosen
+    tactic needs shows up in the sizing steps that follow.
+    """
+    stats = torch.accelerator.memory_stats(device)
+    peak_before = stats.get("allocated_bytes.all.peak", 0) - stats.get(
+        "allocated_bytes.all.current", 0
+    )
+    yield
+    torch.accelerator.reset_peak_memory_stats(device)
+    kv_cache.reserved_headroom_bytes = max(
+        kv_cache.reserved_headroom_bytes, peak_before
+    )
 
 
 def _min_across_ranks(value: int) -> int:
@@ -1061,7 +1081,14 @@ class Worker(WorkerBase):
 
         # Warmup and tune the kernels used during model execution before
         # cuda graph capture.
-        kernel_warmup(self)
+        with (
+            _peak_left_out_of_reserve(
+                self.device, self.model_runner.extensible_kv_cache
+            )
+            if self.cache_config.enable_extensible_kv_cache
+            else nullcontext()
+        ):
+            kernel_warmup(self)
 
         # An extensible KV cache is sized from the peak of these full-batch
         # steps, so they also run when JIT warmup is off (enforce_eager).

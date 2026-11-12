@@ -924,3 +924,30 @@ def test_discarding_the_kv_cache_releases_an_extensible_one(
     assert log == ["release", "pool"]
     Worker.discard(worker, ("weights",))
     assert log == ["release", "pool", "pool"]
+
+
+def test_kernel_warmup_peak_stays_out_of_the_kv_cache_reserve(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    """Autotuning's one-off peak must not shrink the extensible KV cache, while
+    the peak recorded before kernel warmup still counts."""
+    memory = {"peak": 3 * GiB_bytes, "current": GiB_bytes}
+
+    def memory_stats(device):
+        return {
+            "allocated_bytes.all.peak": memory["peak"],
+            "allocated_bytes.all.current": memory["current"],
+        }
+
+    def reset_peak_memory_stats(device):
+        memory["peak"] = memory["current"]
+
+    monkeypatch.setattr(torch.accelerator, "memory_stats", memory_stats)
+    monkeypatch.setattr(
+        torch.accelerator, "reset_peak_memory_stats", reset_peak_memory_stats
+    )
+    kv_cache = SimpleNamespace(reserved_headroom_bytes=GiB_bytes)
+    with gpu_worker._peak_left_out_of_reserve("cuda:0", kv_cache):
+        memory["peak"] = 17 * GiB_bytes  # autotuning every tactic
+    assert kv_cache.reserved_headroom_bytes == 2 * GiB_bytes
+    assert memory["peak"] == memory["current"]
