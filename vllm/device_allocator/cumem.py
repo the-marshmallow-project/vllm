@@ -331,7 +331,7 @@ class CuMemAllocator:
     def wake_up(self, tags: list[str] | None = None) -> None:
         """Wake up the allocator from sleep mode.
         All data that is previously offloaded will be loaded back to GPU
-        memory, and the rest will have empty memory (zeroed on ROCm).
+        memory, and the rest will have zeroed memory.
 
         Args:
             tags: The deferrable tags (weights, kv_cache) to load back to GPU
@@ -358,8 +358,11 @@ class CuMemAllocator:
                         cpu_ptr = cpu_backup_tensor.data_ptr()
                         libcudart.cudaMemcpy(ptr, cpu_ptr, size_in_bytes)
                         data.cpu_backup_tensor = None
-                elif current_platform.is_rocm():
-                    # amdgpu <6.14 may return stale VRAM (#44972); drop with its support
+                else:
+                    # Mapped memory holds whatever the device left there, and amdgpu
+                    # <6.14 returns stale VRAM (#44972). The KV cache must read as
+                    # zeros, as after its first allocation: an FP8 cache's stale
+                    # bytes can encode NaN.
                     libcudart.cudaMemset(ptr, 0, handle[1])
                     torch.accelerator.synchronize()
 
